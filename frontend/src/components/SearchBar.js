@@ -1,35 +1,61 @@
 import React, { useState } from 'react';
-import { TextField, Button, Box, Slider, Typography } from '@mui/material';
-import { Search } from '@mui/icons-material';
+import {
+  TextField, Button, Box, Slider, Typography, InputAdornment
+} from '@mui/material';
+import { Search as SearchIcon } from '@mui/icons-material';
 import { useApp } from '../context/AppContext';
 import { searchProtein, getGraph } from '../services/api';
+import { searchLogger } from '../utils/logger';
 
 function SearchBar() {
   const { state, dispatch } = useApp();
   const [query, setQuery] = useState('');
-  const [localDepth, setLocalDepth] = useState(2);
+  const logger = searchLogger;
+  const [localDepth, setLocalDepth] = useState(state.depth || 2);
+
+  const handleDepthChange = (event, value) => {
+    setLocalDepth(value);
+    dispatch({ type: 'SET_DEPTH', payload: value });
+    logger.debug(`Depth changed to ${value}`);
+  };
 
   const handleSearch = async () => {
-    if (!query.trim()) return;
+    if (!query.trim()) {
+      logger.warn("Search attempted with empty query");
+      return;
+    }
 
+    logger.info(`Search initiated: "${query}" (depth=${localDepth})`);
     dispatch({ type: 'SET_LOADING', payload: true });
     dispatch({ type: 'SET_ERROR', payload: null });
 
     try {
-      // Search for protein
+      logger.debug("Calling searchProtein API...");
       const protein = await searchProtein(query);
+      logger.info(`Protein found: "${protein.name}" (UniProt: ${protein.uniprot_id})`);
       dispatch({ type: 'SET_CURRENT_PROTEIN', payload: protein });
 
-      // Get graph data
       const activeFilters = Object.keys(state.filters).filter(
         (key) => state.filters[key]
       );
-      const graphData = await getGraph(protein.uniprot_id, localDepth, activeFilters);
+      logger.debug(`Active filters: ${activeFilters.join(', ') || 'none'}`);
+      logger.debug("Calling getGraph API...");
+      const graphData = await getGraph(
+        protein.uniprot_id,
+        localDepth,
+        activeFilters.length ? activeFilters : null
+      );
+      logger.info(`Graph loaded: ${graphData.nodes?.length || 0} nodes, ${graphData.edges?.length || 0} edges`);
       dispatch({ type: 'SET_GRAPH_DATA', payload: graphData });
     } catch (error) {
-      dispatch({ type: 'SET_ERROR', payload: error.message });
+      logger.error(`Search failed: ${error.response?.data?.error || error.message}`);
+      dispatch({
+        type: 'SET_ERROR',
+        payload: error.response?.data?.error || error.message,
+      });
     } finally {
       dispatch({ type: 'SET_LOADING', payload: false });
+      logger.debug("Search complete, loading state reset");
     }
   };
 
@@ -40,39 +66,78 @@ function SearchBar() {
   };
 
   return (
-    <Box sx={{ p: 2, bgcolor: 'background.paper', boxShadow: 1 }}>
+    <Box
+      sx={{
+        mx: 4,
+        mt: 3,
+        mb: 2,
+        p: 3,
+        borderRadius: 3,
+        background: 'rgba(26, 26, 46, 0.8)',
+        backdropFilter: 'blur(20px)',
+        border: '1px solid rgba(255,255,255,0.06)',
+        boxShadow: '0 8px 32px rgba(0,0,0,0.3)',
+      }}
+    >
       <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 2 }}>
         <TextField
           fullWidth
           variant="outlined"
-          placeholder="Enter protein name or UniProt ID (e.g., p53, P04637)"
+          placeholder="Search protein name or UniProt ID (e.g., p53, P04637)"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onKeyPress={handleKeyPress}
           disabled={state.loading}
+          size="small"
+          InputProps={{
+            startAdornment: (
+              <InputAdornment position="start">
+                <SearchIcon sx={{ color: '#6C63FF', fontSize: 20 }} />
+              </InputAdornment>
+            ),
+            sx: {
+              backgroundColor: '#0D0D1A',
+              borderRadius: 2,
+            },
+          }}
         />
         <Button
           variant="contained"
-          startIcon={<Search />}
+          startIcon={<SearchIcon />}
           onClick={handleSearch}
           disabled={state.loading || !query.trim()}
+          sx={{
+            minWidth: 120,
+            height: 40,
+            fontSize: '0.9rem',
+          }}
         >
           Search
         </Button>
       </Box>
-      
-      <Box sx={{ px: 1 }}>
-        <Typography variant="body2" gutterBottom>
-          Graph Depth: {localDepth}
+
+      <Box sx={{ px: 1, display: 'flex', alignItems: 'center', gap: 2 }}>
+        <Typography
+          variant="caption"
+          sx={{ color: '#A0A0B8', whiteSpace: 'nowrap', fontWeight: 500 }}
+        >
+          Depth: {localDepth}
         </Typography>
         <Slider
           value={localDepth}
-          onChange={(e, value) => setLocalDepth(value)}
+          onChange={handleDepthChange}
           min={1}
           max={5}
-          marks
+          marks={[
+            { value: 1, label: '1' },
+            { value: 2, label: '2' },
+            { value: 3, label: '3' },
+            { value: 4, label: '4' },
+            { value: 5, label: '5' },
+          ]}
           valueLabelDisplay="auto"
           disabled={state.loading}
+          sx={{ flex: 1 }}
         />
       </Box>
     </Box>

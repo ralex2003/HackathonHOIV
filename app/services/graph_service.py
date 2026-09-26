@@ -1,111 +1,188 @@
-from typing import Dict, List, Set
-from app.models.protein import Protein
+import logging
+from collections import deque
+from typing import Dict, List, Optional, Set
+
 from app.models.interaction import Interaction
+from app.models.protein import Protein
+
+logger = logging.getLogger(__name__)
+
+# Node styling by graph level.
+LEVEL_COLORS = ["#FF6B6B", "#4ECDC4", "#F7DC6F", "#BB8FCE", "#85C1E9", "#F0B27A"]
+LEVEL_SIZES = [30, 20, 16, 14, 12, 11]
+
 
 class GraphService:
     def __init__(self):
+        # Kept for backwards compatibility; traversal state is per-call now so
+        # that concurrent requests cannot contaminate each other.
         self.visited_proteins: Set[str] = set()
-    
-    def build_graph(self, central_protein: Protein, interactions: List[Interaction], 
-                    depth: int = 2, active_filters: List[str] = None) -> Dict:
-        """
-        Build graph data structure for Vis.js visualization.
-        
+
+    def build_graph(
+        self,
+        central_protein: Protein,
+        interactions: List[Interaction],
+        depth: int = 2,
+        active_filters: Optional[List[str]] = None,
+    ) -> Dict:
+        """Build a vis.js-compatible graph, breadth-first from the centre.
+
         Args:
-            central_protein: The starting protein
-            interactions: List of all interactions
-            depth: Maximum depth of the graph
-            active_filters: List of interaction types to include (None = all)
-        
+            central_protein: the protein the graph is centred on.
+            interactions: interaction edges extracted from the literature.
+            depth: how many hops from the centre to include.
+            active_filters: interaction types to include (None = all types).
+
         Returns:
-            Dictionary with nodes and edges for Vis.js
+            {"nodes": [...], "edges": [...], "stats": {...}}
         """
+        logger.info(
+            "Building interaction graph: central_protein='%s', depth=%d, interactions=%d",
+            central_protein.node_id, depth, len(interactions),
+        )
         if active_filters is None:
             active_filters = list(Interaction.TYPES.keys())
-        
-        nodes = {}
-        edges = []
-        
-        # Add central node
-        nodes[central_protein.uniprot_id] = {
-            'id': central_protein.uniprot_id,
-            'label': central_protein.name,
-            'title': central_protein.description or central_protein.name,
-            'level': 0,
-            'color': '#FF6B6B',
-            'size': 30
+            logger.debug("No filters specified, using all interaction types: %s", active_filters)
+        else:
+            active_filters = [f for f in active_filters if f in Interaction.TYPES]
+            if not active_filters:
+                active_filters = list(Interaction.TYPES.keys())
+                logger.warning("All filters removed, defaulting to all interaction types")
+            else:
+                logger.info("Active filters: %s", active_filters)
+
+        depth = max(1, min(int(depth or 1), 5))
+
+        centre_id = central_protein.node_id
+        nodes: Dict[str, dict] = {
+            centre_id: {
+                "id": centre_id,
+                "label": central_protein.name or centre_id,
+                "title": self._tooltip(central_protein),
+                "level": 0,
+                "color": LEVEL_COLORS[0],
+                "size": LEVEL_SIZES[0],
+                "uniprot_id": central_protein.uniprot_id,
+                "gene_name": central_protein.gene_name,
+                "is_central": True,
+            }
         }
-        
-        # Build interaction network
-        self._add_interactions_to_graph(
-            central_protein.uniprot_id, 
-            interactions, 
-            nodes, 
-            edges, 
-            current_depth=0, 
-            max_depth=depth,
-            active_filters=active_filters
+
+        # Index edges by endpoint so lookups during BFS are O(1) instead of
+        # rescanning the whole list for every node (the old recursion was
+        # O(nodes * edges) and could revisit nodes indefinitely).
+        adjacency: Dict[str, List[Interaction]] = {}
+        allowed = 0
+        filtered_out = 0
+        for interaction in interactions:
+            if interaction.interaction_type not in active_filters:
+                filtered_out += 1
+                continue
+            allowed += 1
+            adjacency.setdefault(interaction.source_protein, []).append(interaction)
+            adjacency.setdefault(interaction.target_protein, []).append(interaction)
+
+        logger.info(
+            "Graph indexing: %d interactions passed filter, %d filtered out",
+            allowed, filtered_out,
         )
-        
-        return {
-            'nodes': list(nodes.values()),
-            'edges': edges
-        }
-    
-    def _add_interactions_to_graph(self, protein_id: str, interactions: List[Interaction],
-                                   nodes: Dict, edges: List, current_depth: int,
-                                   max_depth: int, active_filters: List[str]):
-        """Recursively add interactions to graph"""
-        if current_depth >= max_depth:
-            return
-        
-        # Find interactions involving this protein
-        related_interactions = [
-            i for i in interactions 
-            if i.source_protein == protein_id or i.target_protein == protein_id
-            and i.interaction_type in active_filters
-        ]
-        
-        for interaction in related_interactions:
-            # Determine the other protein
-            other_protein = (interaction.target_protein if interaction.source_protein == protein_id 
-                           else interaction.source_protein)
-            
-            # Add node if not exists
-            if other_protein not in nodes:
-                nodes[other_protein] = {
-                    'id': other_protein,
-                    'label': other_protein,
-                    'title': other_protein,
-                    'level': current_depth + 1,
-                    'color': '#4ECDC4',
-                    'size': 20
+
+        edges: List[dict] = []
+        seen_edges: Set[tuple] = set()
+        visited: Set[str] = {centre_id}
+        queue: deque = deque([(centre_id, 0)])
+
+        logger.debug("Starting BFS from node '%s' with depth=%d", centre_id, depth)
+
+        while queue:
+            current_id, level = queue.popleft()
+            if level >= depth:
+                continue
+
+            for interaction in adjacency.get(current_id, []):
+                source = interaction.source_protein
+                target = interaction.target_protein
+                other = target if source == current_id else source
+                if not other or other == current_id:
+                    continue
+
+                key = interaction.key()
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    edges.append(self._build_edge(interaction, source, target))
+
+                if other in visited:
+                    continue
+
+                visited.add(other)
+                nodes[other] = {
+                    "id": other,
+                    "label": other,
+                    "title": self._neighbour_tooltip(other, interaction),
+                    "level": level + 1,
+                    "color": LEVEL_COLORS[min(level + 1, len(LEVEL_COLORS) - 1)],
+                    "size": LEVEL_SIZES[min(level + 1, len(LEVEL_SIZES) - 1)],
+                    "is_central": False,
                 }
-            
-            # Add edge
-            edge_exists = any(
-                e['from'] == protein_id and e['to'] == other_protein 
-                for e in edges
-            )
-            
-            if not edge_exists:
-                edges.append({
-                    'from': protein_id,
-                    'to': other_protein,
-                    'label': Interaction.TYPES.get(interaction.interaction_type, interaction.interaction_type),
-                    'title': f"{Interaction.TYPES.get(interaction.interaction_type, interaction.interaction_type)} ({len(interaction.papers)} papers)",
-                    'interaction_type': interaction.interaction_type,
-                    'paper_count': len(interaction.papers),
-                    'papers': [p.pmid for p in interaction.papers]
-                })
-            
-            # Recursively add interactions for the other protein
-            self._add_interactions_to_graph(
-                other_protein, 
-                interactions, 
-                nodes, 
-                edges, 
-                current_depth + 1, 
-                max_depth,
-                active_filters
-            )
+                queue.append((other, level + 1))
+
+        result = {
+            "nodes": list(nodes.values()),
+            "edges": edges,
+            "stats": {
+                "central_protein": centre_id,
+                "uniprot_id": central_protein.uniprot_id,
+                "depth": depth,
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+                "interactions_considered": len(interactions),
+                "interactions_after_filter": allowed,
+                "active_filters": active_filters,
+            },
+        }
+
+        logger.info(
+            "Graph built: %d nodes, %d edges, depth=%d",
+            len(nodes), len(edges), depth,
+        )
+        return result
+
+    def _build_edge(self, interaction: Interaction, source: str, target: str) -> dict:
+        label = interaction.type_label
+        pmids = [p.pmid for p in interaction.papers]
+        return {
+            "from": source,
+            "to": target,
+            # The interaction type must be part of the id: a pair of proteins
+            # can interact in more than one way (physical_binding AND
+            # regulatory), and vis-network's DataSet throws
+            # "Cannot add item: item with id X already exists" if two edges
+            # share an id.
+            "id": "|".join(interaction.key()),
+            "label": label,
+            "title": f"{label} ({len(pmids)} paper{'s' if len(pmids) != 1 else ''})",
+            "interaction_type": interaction.interaction_type,
+            "paper_count": len(pmids),
+            "papers": pmids,
+        }
+
+    @staticmethod
+    def _tooltip(protein: Protein) -> str:
+        parts = [f"<b>{protein.name}</b>"]
+        if protein.description:
+            parts.append(protein.description)
+        if protein.organism:
+            parts.append(f"Organism: {protein.organism}")
+        parts.append(f"UniProt: {protein.uniprot_id}")
+        return "<br>".join(parts)
+
+    @staticmethod
+    def _neighbour_tooltip(node_id: str, interaction: Interaction) -> str:
+        parts = [f"<b>{node_id}</b>"]
+        if interaction.context:
+            parts.append(interaction.context[:300])
+        if interaction.papers:
+            first = interaction.papers[0]
+            parts.append(f"Source: {first.title[:160]}")
+        parts.append("Click for details")
+        return "<br>".join(parts)

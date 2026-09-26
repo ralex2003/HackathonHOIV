@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useReducer, useState } from 'react';
+import { contextLogger } from '../utils/logger';
 
 const AppContext = createContext();
 
@@ -20,6 +21,7 @@ const initialState = {
 };
 
 function appReducer(state, action) {
+  contextLogger.debug(`Action: ${action.type}`);
   switch (action.type) {
     case 'SET_CURRENT_PROTEIN':
       return { ...state, currentProtein: action.payload };
