@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useRef } from 'react';
 import {
   Drawer,
   Box,
@@ -17,6 +17,8 @@ import { proteinLogger } from '../utils/logger';
 function ProteinDetailsPanel() {
   const { state, dispatch, proteinDetailsOpen, setProteinDetailsOpen } = useApp();
   const logger = proteinLogger;
+  const selectedNodeRef = useRef(state.selectedNode);
+  selectedNodeRef.current = state.selectedNode;
 
   const handleClose = () => {
     logger.debug("Closing protein details panel");
@@ -25,9 +27,10 @@ function ProteinDetailsPanel() {
   };
 
   const handleLoadConnections = async () => {
-    if (!state.selectedNode) return;
+    const node = selectedNodeRef.current;
+    if (!node) return;
 
-    logger.info(`Loading connections for: ${state.selectedNode.label || state.selectedNode.id}`);
+    logger.info(`Loading connections for: ${node.label || node.id}`);
     dispatch({ type: 'SET_LOADING', payload: true });
 
     try {
@@ -35,7 +38,7 @@ function ProteinDetailsPanel() {
         (key) => state.filters[key]
       );
       const graphData = await getGraph(
-        state.selectedNode.id,
+        node.id,
         state.depth,
         activeFilters
       );
@@ -50,23 +53,27 @@ function ProteinDetailsPanel() {
   };
 
   const loadProteinDetails = async () => {
-    if (!state.selectedNode) return;
+    const node = selectedNodeRef.current;
+    if (!node) return;
 
-    logger.debug(`Loading detailed info for: ${state.selectedNode.id}`);
+    logger.debug(`Loading detailed info for: ${node.id}`);
     try {
-      const protein = await getProtein(state.selectedNode.id);
-      logger.info(`Protein details loaded: ${protein.name || state.selectedNode.id}`);
-      dispatch({ type: 'SET_SELECTED_NODE', payload: { ...state.selectedNode, ...protein } });
+      const protein = await getProtein(node.id);
+      logger.info(`Protein details loaded: ${protein.name || node.id}`);
+      dispatch({ type: 'SET_SELECTED_NODE', payload: { ...node, ...protein } });
     } catch (error) {
       logger.error('Error loading protein details:', error);
     }
   };
 
+  const selectedNodeId = state.selectedNode?.id;
+
   React.useEffect(() => {
-    if (state.selectedNode && proteinDetailsOpen && !state.selectedNode.function) {
+    const node = selectedNodeRef.current;
+    if (proteinDetailsOpen && node && !node.function) {
       loadProteinDetails();
     }
-  }, [state.selectedNode, proteinDetailsOpen]);
+  }, [proteinDetailsOpen, selectedNodeId]);
 
   if (!state.selectedNode) return null;
 
@@ -129,8 +136,8 @@ function ProteinDetailsPanel() {
           <Typography variant="subtitle2" sx={{ color: '#A0A0B8', mb: 1, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
             Description
           </Typography>
-          <Typography variant="body2" sx={{ color: '#E8E8F0', lineHeight: 1.7, fontSize: '0.9rem' }}>
-            {node.description}
+          <Typography variant="body2" sx={{ color: node.description ? '#E8E8F0' : '#A0A0B8', lineHeight: 1.7, fontSize: '0.9rem', fontStyle: node.description ? 'normal' : 'italic' }}>
+            {node.description || 'Loading description...'}
           </Typography>
         </Box>
 
@@ -175,6 +182,39 @@ function ProteinDetailsPanel() {
             <Typography variant="body2" sx={{ color: '#E8E8F0', fontSize: '0.9rem' }}>
               {node.organism}
             </Typography>
+          </Box>
+        )}
+
+        {/* LLM-generated summary */}
+        {node.llm_summary && (
+          <Box sx={{ mb: 3 }}>
+            <Typography variant="subtitle2" sx={{ color: '#A0A0B8', mb: 1, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+              AI Summary
+            </Typography>
+            {node.llm_summary.function && (
+              <Box sx={{ mb: 1.5 }}>
+                <Typography variant="body2" sx={{ color: '#E8E8F0', lineHeight: 1.7, fontSize: '0.85rem' }}>
+                  <strong style={{ color: '#4ECDC4' }}>Function:</strong>{' '}
+                  {node.llm_summary.function}
+                </Typography>
+              </Box>
+            )}
+            {node.llm_summary.pathways && (
+              <Box sx={{ mb: 1.5 }}>
+                <Typography variant="body2" sx={{ color: '#E8E8F0', lineHeight: 1.7, fontSize: '0.85rem' }}>
+                  <strong style={{ color: '#F7DC6F' }}>Pathways:</strong>{' '}
+                  {node.llm_summary.pathways}
+                </Typography>
+              </Box>
+            )}
+            {node.llm_summary.localization && (
+              <Box sx={{ mb: 1.5 }}>
+                <Typography variant="body2" sx={{ color: '#E8E8F0', lineHeight: 1.7, fontSize: '0.85rem' }}>
+                  <strong style={{ color: '#BB8FCE' }}>Localization:</strong>{' '}
+                  {node.llm_summary.localization}
+                </Typography>
+              </Box>
+            )}
           </Box>
         )}
 

@@ -20,11 +20,11 @@ def load_env(path: Path = None) -> bool:
         from dotenv import load_dotenv
 
         load_dotenv(target, override=False)
-        return True
-    except ImportError:
-        pass
+        return True 
+    except ImportError: 
+        pass 
 
-    # Minimal parser: KEY=VALUE, # comments, optional quotes.
+    # Minimal parser: KEY=VALUE, # comments, optio nal quotes.
     try:
         for raw_line in target.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()

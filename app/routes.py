@@ -1,11 +1,13 @@
 import asyncio
 import os
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Set, Dict
+from collections import deque
 
 from flask import Blueprint, jsonify, request
 
 from app.models.interaction import Interaction
+from app.models.paper import Paper
 from app.models.protein import Protein
 from app.services.graph_service import GraphService
 from app.services.llm_service import LLMService
@@ -25,22 +27,15 @@ llm_service = LLMService()
 graph_service = GraphService()
 protein_resolver = ProteinResolver()
 
-MAX_PAPERS = 50
-
-# How many abstracts to run through extraction per request. This is the main
-# cost lever: one LLM call per abstract. Groq's free tier allows roughly
-# 8000 tokens/minute, so a large value means minutes of waiting and 429s.
+MAX_PAPERS = 3
 MAX_ABSTRACTS_FOR_EXTRACTION = int(
-    os.environ.get("PROTEIN_LLM_MAX_ABSTRACTS", "20")
+    os.environ.get("PROTEIN_LLM_MAX_ABSTRACTS", "3")
 )
-
+# Total cap on LLM calls across ALL levels of the crawl.
+# At 3 abstracts per node and 2 levels, that's ~9 calls max for depth=2.
+MAX_LLM_CALLS = int(os.environ.get("PROTEIN_LLM_MAX_TOTAL_CALLS", "30"))
 
 def run_async(coro):
-    """Run a coroutine on a dedicated loop and always close it.
-
-    The previous handler code built a new loop per request and never closed
-    it, leaking a file descriptor per request.
-    """
     return asyncio.run(coro)
 
 
@@ -48,37 +43,27 @@ def _json_body() -> dict:
     return request.get_json(silent=True) or {}
 
 
-async def collect_interactions(
-    protein: Protein, max_papers: int = MAX_PAPERS
-) -> Tuple[List[Interaction], List, dict]:
-    """Gather papers for a protein and extract interactions from them.
+async def _crawl_node(
+    protein: Protein,
+    max_papers: int,
+    llm_budget_ref: dict,
+) -> Tuple[List[Interaction], List[Paper], dict]:
+    """Fetch papers for one protein and extract interactions from their abstracts.
 
-    Interactions reported by more than one paper are merged into a single edge
-    so that `paper_count` reflects real supporting evidence. Previously each
-    paper produced its own Interaction, so every edge reported exactly 1 paper
-    no matter how much literature backed it.
-
-    The merged result is cached per protein because extraction is the expensive
-    stage: with a real LLM backend this is one model call per abstract, and
-    filter/depth changes must not re-pay for it.
+    Returns (interactions, papers, meta) for this single node.
+    Respects llm_budget_ref and returns empty results if the budget is exhausted.
     """
     terms = protein.search_terms()
-    logger.info(
-        "collect_interactions started for protein='%s', max_papers=%d, search_terms=%s",
-        protein.node_id, max_papers, terms,
-    )
     if not terms:
-        logger.warning("No search terms for protein '%s'", protein.node_id)
-        return [], [], {"query": None, "total_matches": 0}
+        return [], [], {"query": None, "total_matches": 0, "skipped": "no_search_terms"}
 
-    cache_key = f"interactions:{protein.uniprot_id}:{max_papers}:{llm_service.is_configured}"
+    cache_key = f"node:{protein.uniprot_id}:{max_papers}:{llm_service.is_configured}"
     cached = cache.get(cache_key)
     if cached is not None:
-        logger.info("Cache HIT for interactions: %s", cache_key)
-        interactions, papers, meta = cached
-        return list(interactions), list(papers), dict(meta)
+        logger.info("Node cache HIT for %s", protein.node_id)
+        return cached
 
-    logger.info("Cache MISS for interactions, fetching from PubMed...")
+    logger.info("Node crawl: protein='%s', searching PubMed...", protein.node_id)
     query = pubmed_service.build_query(terms)
     pmids = await pubmed_service.search_papers(query, max_results=max_papers)
     papers = await pubmed_service.fetch_multiple_papers(pmids)
@@ -87,25 +72,31 @@ async def collect_interactions(
     merged: dict = {}
     used = 0
     sources: dict = {}
+
     for paper in papers:
         if not paper.abstract or used >= MAX_ABSTRACTS_FOR_EXTRACTION:
             continue
+        if llm_budget_ref["count"] >= llm_budget_ref["max"]:
+            logger.warning("LLM budget exhausted at node %s", protein.node_id)
+            break
+
         used += 1
+        llm_budget_ref["count"] += 1
         logger.debug(
-            "Extracting interactions from paper PMID=%s (%d/%d)",
-            paper.pmid, used, MAX_ABSTRACTS_FOR_EXTRACTION,
+            "Extracting interactions from PMID=%s (%d/%d max_llm=%d)",
+            paper.pmid, llm_budget_ref["count"], llm_budget_ref["max"], llm_budget_ref["max"],
         )
         extracted = await llm_service.extract_interactions(paper.abstract, symbol)
         source = extracted.get("source", "unknown")
         sources[source] = sources.get(source, 0) + 1
         for item in extracted.get("interactions", []) or []:
-            source = item.get("source_protein")
-            target = item.get("target_protein")
-            if not source or not target or source == target:
+            src = item.get("source_protein")
+            tgt = item.get("target_protein")
+            if not src or not tgt or src == tgt:
                 continue
             interaction = Interaction(
-                source_protein=source,
-                target_protein=target,
+                source_protein=src,
+                target_protein=tgt,
                 interaction_type=Interaction.normalize_type(
                     item.get("interaction_type", "")
                 ),
@@ -118,84 +109,154 @@ async def collect_interactions(
             else:
                 merged[key] = interaction
 
-    # Canonicalise every endpoint to a single UniProt-approved symbol BEFORE
-    # the graph is built, so one protein can only ever become one node. Without
-    # this, "p53" from one abstract and "TP53" from another produce two nodes
-    # for the same protein, joined by nothing.
-    endpoints = set()
-    for interaction in merged.values():
-        endpoints.add(interaction.source_protein)
-        endpoints.add(interaction.target_protein)
-    canonical = await protein_resolver.resolve_many(endpoints)
-
-    rewritten = 0
-    dropped = 0
-    collapsed = 0
-    remapped: dict = {}
-
-    def canonical_of(symbol: str) -> str:
-        # resolve_many() keys by NORMALISED symbol, so the lookup key must be
-        # normalised too. Looking up the raw string silently missed every
-        # lower-case endpoint, which is exactly the alias case being fixed.
-        return canonical.get(
-            protein_resolver.normalize(symbol), symbol.strip() if symbol else ""
-        )
-
-    for interaction in merged.values():
-        new_source = canonical_of(interaction.source_protein)
-        new_target = canonical_of(interaction.target_protein)
-        if new_source != interaction.source_protein or new_target != interaction.target_protein:
-            rewritten += 1
-            remapped[interaction.key()] = None
-        if not new_source or not new_target or new_source == new_target:
-            # The two endpoints turned out to be the same protein.
-            dropped += 1
-            continue
-        interaction.source_protein = new_source
-        interaction.target_protein = new_target
-
-    # Re-key and re-merge, so edges that collapsed onto the same canonical pair
-    # are combined rather than silently overwriting each other.
-    if rewritten or dropped:
-        rebuilt: dict = {}
-        for interaction in merged.values():
-            if not interaction.source_protein or not interaction.target_protein:
-                continue
-            if interaction.source_protein == interaction.target_protein:
-                continue
-            key = interaction.key()
-            if key in rebuilt:
-                rebuilt[key].merge(interaction)
-                collapsed += 1
-            else:
-                rebuilt[key] = interaction
-        merged = rebuilt
-        logger.info(
-            "Symbol canonicalisation: %d endpoint(s) rewritten, %d self-interaction(s) "
-            "dropped, %d edge(s) merged",
-            rewritten, dropped, collapsed,
-        )
-
     meta = {
         "query": query,
         "total_pmids": len(pmids),
         "papers_fetched": len(papers),
         "papers_with_abstract": used,
-        "abstracts_attempted_max": MAX_ABSTRACTS_FOR_EXTRACTION,
-        "search_terms": terms,
         "extraction_sources": sources,
-        "llm_status": llm_service.status,
-        "symbols_canonicalised": rewritten,
-        "self_interactions_dropped": dropped,
-        "edges_merged_after_canonicalisation": collapsed,
+        "llm_calls_used": llm_budget_ref["count"],
     }
     result = (list(merged.values()), papers, meta)
     cache.set(cache_key, result)
     logger.info(
-        "collect_interactions complete for '%s': %d interactions from %d papers",
+        "Node crawl complete for '%s': %d interactions from %d papers",
         protein.node_id, len(merged), len(papers),
     )
     return result
+
+
+async def collect_interactions(
+    protein: Protein, max_papers: int = MAX_PAPERS, depth: int = 2
+) -> Tuple[List[Interaction], List, dict]:
+    """Multi-level BFS crawl: collects interactions from the root protein AND
+    recursively from all discovered neighbours up to the requested depth.
+
+    Algorithm:
+      1. Start with the root protein as the frontier (level 0).
+      2. For each node in the frontier: search PubMed, fetch papers,
+         extract interactions via LLM.
+      3. Collect all discovered neighbour proteins.
+      4. Those neighbours become the next frontier (level 1).
+      5. Repeat until depth is reached, the frontier is empty, or the
+         LLM budget is exhausted.
+      6. Canonicalise all endpoints across all levels and merge.
+
+    Returns (all_interactions, all_papers, meta).
+    """
+    depth = max(1, min(int(depth or 1), 5))
+    logger.info(
+        "collect_interactions START for protein='%s', max_papers=%d, depth=%d",
+        protein.node_id, max_papers, depth,
+    )
+
+    llm_budget = {"count": 0, "max": MAX_LLM_CALLS}
+    visited: Set[str] = {protein.node_id}
+    frontier: List[Protein] = [protein]
+    all_interactions: List[Interaction] = []
+    all_papers: List[Paper] = []
+    truncations: List[dict] = []
+
+    for level in range(depth):
+        if not frontier:
+            logger.info("Frontier empty at level %d, stopping.", level)
+            break
+        if llm_budget["count"] >= llm_budget["max"]:
+            truncations.append({"reason": "max_llm_calls", "level": level, "llm_calls_used": llm_budget["count"]})
+            logger.warning("LLM budget exhausted before level %d", level)
+            break
+
+        next_frontier_proteins: List[Protein] = []
+        level_interactions: List[Interaction] = []
+        per_node_meta: Dict[str, dict] = {}
+
+        for node_protein in frontier:
+            interactions, papers, meta = await _crawl_node(
+                node_protein, max_papers, llm_budget
+            )
+            level_interactions.extend(interactions)
+            all_papers.extend(papers)
+            per_node_meta[node_protein.node_id] = meta
+
+            # Discover new proteins at this level for the next frontier.
+            for interaction in interactions:
+                for endpoint in (interaction.source_protein, interaction.target_protein):
+                    if endpoint not in visited:
+                        visited.add(endpoint)
+                        resolved = await protein_service.get_protein_by_name(endpoint)
+                        if resolved:
+                            next_frontier_proteins.append(resolved)
+
+        all_interactions.extend(level_interactions)
+
+        logger.info(
+            "Level %d: %d interactions from %d nodes, %d new proteins for level %d",
+            level, len(level_interactions), len(frontier), len(next_frontier_proteins), level + 1,
+        )
+
+        frontier = next_frontier_proteins
+
+    # Canonicalise ALL endpoints across ALL levels at once.
+    if all_interactions:
+        endpoints: Set[str] = set()
+        for interaction in all_interactions:
+            endpoints.add(interaction.source_protein)
+            endpoints.add(interaction.target_protein)
+        canonical = await protein_resolver.resolve_many(endpoints)
+
+        def canonical_of(symbol: str) -> str:
+            return canonical.get(
+                protein_resolver.normalize(symbol), symbol.strip() if symbol else ""
+            )
+
+        rewritten = 0
+        dropped = 0
+        for interaction in all_interactions:
+            new_source = canonical_of(interaction.source_protein)
+            new_target = canonical_of(interaction.target_protein)
+            if not new_source or not new_target or new_source == new_target:
+                dropped += 1
+                continue
+            interaction.source_protein = new_source
+            interaction.target_protein = new_target
+            if new_source != interaction.source_protein or new_target != interaction.target_protein:
+                rewritten += 1
+
+        # Re-merge edges that collapsed onto the same canonical pair.
+        merged_map: dict = {}
+        for interaction in all_interactions:
+            if not interaction.source_protein or not interaction.target_protein:
+                continue
+            if interaction.source_protein == interaction.target_protein:
+                continue
+            key = interaction.key()
+            if key in merged_map:
+                merged_map[key].merge(interaction)
+            else:
+                merged_map[key] = interaction
+        all_interactions = list(merged_map.values())
+
+        logger.info(
+            "Global canonicalisation: %d rewritten, %d dropped, %d final edges",
+            rewritten, dropped, len(all_interactions),
+        )
+
+    meta = {
+        "max_papers": max_papers,
+        "depth_requested": depth,
+        "levels_completed": depth if not truncations else truncations[-1].get("level", 0),
+        "total_llm_calls": llm_budget["count"],
+        "max_llm_calls": MAX_LLM_CALLS,
+        "truncations": truncations,
+        "per_node_meta": per_node_meta if all_interactions else {},
+        "total_pmids": len(all_papers),
+    }
+
+    logger.info(
+        "collect_interactions complete for '%s': %d interactions across %d levels, %d LLM calls",
+        protein.node_id, len(all_interactions), depth, llm_budget["count"],
+    )
+    return all_interactions, all_papers, meta
 
 
 @bp.route("/api/search", methods=["POST"])
@@ -267,7 +328,8 @@ def get_interactions():
     """Interactions for a protein, with the papers that support them."""
     body = _json_body()
     protein_id = (body.get("protein_id") or "").strip()
-    logger.info("POST /api/interactions — protein_id='%s'", protein_id)
+    depth = body.get("depth", 2)
+    logger.info("POST /api/interactions — protein_id='%s', depth=%d", protein_id, depth)
     if not protein_id:
         logger.warning("Interactions request rejected: missing protein_id")
         return jsonify({"error": "Protein ID is required"}), 400
@@ -278,7 +340,7 @@ def get_interactions():
         return jsonify({"error": "Protein not found"}), 404
 
     logger.info("Collecting interactions for protein '%s'...", protein_id)
-    interactions, _papers, meta = run_async(collect_interactions(protein))
+    interactions, _papers, meta = run_async(collect_interactions(protein, depth=depth))
     logger.info(
         "Interactions collected for '%s': %d interactions, %d papers",
         protein_id, len(interactions), meta.get("total_pmids", 0),
@@ -291,6 +353,39 @@ def get_interactions():
             **meta,
         }
     )
+
+
+@bp.route("/api/connection-summary", methods=["POST"])
+def get_connection_summary():
+    """Generate an LLM summary of what a connection does and what the papers say about it."""
+    body = _json_body()
+    source_protein = (body.get("source_protein") or "").strip()
+    target_protein = (body.get("target_protein") or "").strip()
+    interaction_type = (body.get("interaction_type") or "").strip()
+    paper_titles = body.get("paper_titles") or ""
+    context = body.get("context")
+
+    logger.info(
+        "POST /api/connection-summary — %s - %s (%s)",
+        source_protein, target_protein, interaction_type,
+    )
+    if not source_protein or not target_protein:
+        logger.warning("Connection summary rejected: missing proteins")
+        return jsonify({"error": "Source and target proteins are required"}), 400
+
+    summary = run_async(
+        llm_service.generate_connection_summary(
+            source_protein, target_protein, interaction_type,
+            paper_titles, context,
+        )
+    )
+    logger.info("Connection summary generated for %s - %s", source_protein, target_protein)
+    return jsonify({
+        "source_protein": source_protein,
+        "target_protein": target_protein,
+        "interaction_type": interaction_type,
+        "summary": summary,
+    })
 
 
 @bp.route("/api/papers/<pmid>", methods=["GET"])
@@ -327,7 +422,7 @@ def get_graph():
         return jsonify({"error": "Protein not found"}), 404
 
     logger.info("Collecting interactions for graph building...")
-    interactions, papers, meta = run_async(collect_interactions(protein))
+    interactions, papers, meta = run_async(collect_interactions(protein, depth=depth))
     logger.info(
         "Building graph: %d interactions, %d papers, depth=%d",
         len(interactions), len(papers), depth,
@@ -340,7 +435,6 @@ def get_graph():
     graph_data["meta"] = {**meta, **graph_data.get("stats", {})}
     graph_data["llm"] = llm_service.health()
 
-    sources = meta.get("extraction_sources", {})
     if pubmed_service.last_error:
         graph_data["warning"] = (
             f"PubMed search failed, so this graph is incomplete or empty. "
@@ -354,20 +448,20 @@ def get_graph():
             "This app does not fabricate interactions."
         )
         graph_data["severity"] = "error"
-    elif not meta.get("total_pmids"):
+    elif meta.get("truncations"):
+        trunc = meta["truncations"][0]
+        graph_data["warning"] = (
+            f"Crawl was truncated: {trunc}. "
+            f"Total LLM calls used: {meta.get('total_llm_calls', 0)}/{meta.get('max_llm_calls', 'unknown')}. "
+            f"Graph may be incomplete."
+        )
+        graph_data["severity"] = "warning"
+    elif not meta.get("per_node_meta"):
         graph_data["warning"] = (
             "PubMed returned no papers for this protein, so there is no "
             "evidence to extract from."
         )
         graph_data["severity"] = "warning"
-    elif sources.get("error"):
-        graph_data["warning"] = (
-            f"LLM calls failed for {sources['error']} of "
-            f"{meta.get('papers_with_abstract', 0)} abstracts, so those papers "
-            f"contributed no edges. Last error: "
-            f"{llm_service.health()['stats'].get('last_error')}"
-        )
-        graph_data["severity"] = "error"
     else:
         graph_data["severity"] = "ok"
     return jsonify(graph_data)
@@ -420,7 +514,7 @@ def validate_graph():
     if not protein:
         return jsonify({"error": "Protein not found"}), 404
 
-    interactions, _papers, _meta = run_async(collect_interactions(protein))
+    interactions, _papers, _meta = run_async(collect_interactions(protein, depth=depth))
     graph_data = graph_service.build_graph(protein, interactions, depth, filters)
 
     report = run_async(

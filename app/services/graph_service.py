@@ -64,6 +64,7 @@ class GraphService:
                 "size": LEVEL_SIZES[0],
                 "uniprot_id": central_protein.uniprot_id,
                 "gene_name": central_protein.gene_name,
+                "description": central_protein.description,
                 "is_central": True,
             }
         }
@@ -109,7 +110,7 @@ class GraphService:
                 key = interaction.key()
                 if key not in seen_edges:
                     seen_edges.add(key)
-                    edges.append(self._build_edge(interaction, source, target))
+                    edges.append(self._build_edge(interaction, source, target, level, level + 1))
 
                 if other in visited:
                     continue
@@ -147,23 +148,27 @@ class GraphService:
         )
         return result
 
-    def _build_edge(self, interaction: Interaction, source: str, target: str) -> dict:
+    def _build_edge(self, interaction: Interaction, source: str, target: str,
+                    source_level: int = 0, target_level: int = 1) -> dict:
         label = interaction.type_label
         pmids = [p.pmid for p in interaction.papers]
+        level_skipping = abs(target_level - source_level) > 1
+        context = interaction.context[:400] if interaction.context else None
+        contexts = [interaction.context] if interaction.context else []
         return {
             "from": source,
             "to": target,
-            # The interaction type must be part of the id: a pair of proteins
-            # can interact in more than one way (physical_binding AND
-            # regulatory), and vis-network's DataSet throws
-            # "Cannot add item: item with id X already exists" if two edges
-            # share an id.
             "id": "|".join(interaction.key()),
             "label": label,
             "title": f"{label} ({len(pmids)} paper{'s' if len(pmids) != 1 else ''})",
             "interaction_type": interaction.interaction_type,
             "paper_count": len(pmids),
             "papers": pmids,
+            "level_skipping": level_skipping,
+            "source_level": source_level,
+            "target_level": target_level,
+            "context": context,
+            "contexts": contexts,
         }
 
     @staticmethod

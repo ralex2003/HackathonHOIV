@@ -13,7 +13,7 @@ Left alone, one paper saying "p53" and another saying "TP53" produces two
 nodes for the same protein, joined by nothing. UniProt accessions are the
 authority here: they are stable and unambiguous, so identity is decided by
 accession rather than by spelling.
-"""
+"""  
 
 import asyncio
 import logging

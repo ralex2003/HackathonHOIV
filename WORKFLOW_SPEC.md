@@ -1780,3 +1780,263 @@ and multi-tenancy; PDF parsing for non-OA publishers (paywalled, legally and
 technically messy — PMC covers the OA subset); and species-specific
 interaction databases such as the fly or worm BioGRID, which would be the
 natural next step if §15.4's concern ever becomes a requirement.
+
+---
+
+## 16. Session Recovery Guide
+
+If this project is picked up in a new session, read this section first.
+
+### 16.1 Current state summary
+
+The application is a working Flask + React web app that visualizes protein-protein
+interaction networks. It is **not** fully implemented per §1-15 — the full
+crawl pipeline (SQLite, orthologs, directed edges, async jobs) is specified but
+not yet built. What exists today is a functional prototype.
+
+**What works today:**
+- Backend: Flask server with 7 endpoints, PubMed search, UniProt protein lookup,
+  LLM-based interaction extraction, graph building, caching, rate limiting
+- Frontend: React + MUI dark theme, interactive vis-network graph, search,
+  filter, protein details panel, paper list panel
+- Logging: Full structured logging on both backend and frontend
+
+**What does NOT work yet (per spec §1-15):**
+- SQLite persistence (currently in-memory cache only)
+- Ortholog cross-organism expansion
+- Directed edges and subtypes
+- Async background crawl jobs
+- Full-text PMC fetching
+- Depth slider actually crawls multiple levels (it's currently cosmetic —
+  the graph is always one ring deep)
+
+### 16.2 How to run the application
+
+```bash
+# Terminal 1 — Backend
+cd C:\Users\aless\OneDrive\Desktop\Hackathon
+pip install -r requirements.txt
+python run.py
+# Server starts on http://localhost:5000
+
+# Terminal 2 — Frontend
+cd frontend
+npm install
+npm start
+# App opens on http://localhost:3000
+```
+
+**Required `.env` file** (already exists at `C:\Users\aless\OneDrive\Desktop\Hackathon\.env`):
+```
+PROTEIN_LLM_API_KEY=gsk_REDACTED
+PROTEIN_LLM_ALLOW_PLACEHOLDER_FALLBACK=0
+```
+The backend reads `.env` on startup via `app/config.py`. Edit `.env` and restart
+the backend. The frontend talks to `http://localhost:5000` (hardcoded in
+`frontend/src/services/api.js`).
+
+### 16.3 File map (current)
+
+```
+C:\Users\aless\OneDrive\Desktop\Hackathon\
+├── .env                          # Environment variables (LLM key, etc.)
+├── .env.example                  # Template
+├── run.py                        # Entry point: app.run(debug=True, port=5000)
+├── requirements.txt              # Flask, Flask-CORS, biopython, requests, python-dotenv
+├── app/
+│   ├── __init__.py              # create_app(), setup_logging() call
+│   ├── config.py                # .env loader
+│   ├── routes.py                # All HTTP endpoints + collect_interactions()
+│   ├── utils/
+│   │   ├── __init__.py          # Exports SimpleCache, cache, AsyncRateLimiter, setup_logging, logger
+│   │   ├── logger.py            # ColouredFormatter, setup_logging() — NEW
+│   │   ├── cache.py             # SimpleCache (in-memory, TTL 3600s)
+│   │   └── rate_limiter.py      # AsyncRateLimiter
+│   ├── models/
+│   │   ├── __init__.py          # Exports Protein, Interaction, Paper
+│   │   ├── protein.py           # Protein dataclass, search_terms()
+│   │   ├── interaction.py       # Interaction dataclass, 4 types, normalize_type()
+│   │   └── paper.py             # Paper dataclass
+│   └── services/
+│       ├── pubmed_service.py    # PubMed API (esearch, efetch, MEDLINE parser)
+│       ├── protein_service.py   # UniProt REST API resolver
+│       ├── llm_service.py       # LLM extraction + summary (Groq-compatible)
+│       ├── graph_service.py     # BFS graph builder
+│       └── __init__.py          # Not present (imports work via module paths)
+├── frontend/
+│   ├── package.json
+│   └── src/
+│       ├── index.js             # React entry point
+│       ├── index.css            # Dark theme global styles, animations, scrollbar
+│       ├── App.js               # Dark MUI theme, layout, search bar, graph, panels
+│       ├── context/
+│       │   └── AppContext.js    # React context: state, dispatch, useApp()
+│       ├── utils/
+│       │   └── logger.js        # createLogger() — per-module console loggers
+│       ├── services/
+│       │   └── api.js           # Axios with interceptors, API functions
+│       └── components/
+│           ├── SearchBar.js      # Search + depth slider
+│           ├── GraphVisualization.js  # vis-network, zoom, export, legend
+│           ├── ProteinDetailsPanel.js # Right drawer, protein info, load connections
+│           ├── PaperListPanel.js      # Left drawer, related papers
+│           └── FilterControls.js      # Interaction type filter checkboxes
+└── WORKFLOW_SPEC.md             # This file
+```
+
+### 16.4 Logging implementation details
+
+#### Backend logging (`app/utils/logger.py`)
+- `ColouredFormatter` class: ANSI-coloured level names, timestamps, module names
+- `setup_logging(level, show_timestamp, log_to_file)` function
+- Called in `app/__init__.py` on import and `run.py` on startup
+- All service modules import `logger = logging.getLogger(__name__)`
+- Every method logs: entry points, cache hits/misses, API calls, results, errors
+- `exc_info=True` on all error logs for full traceback in console
+
+**Log format:** `[2024-01-15 10:30:45] INFO  pubmed_service — Searching PubMed: query='...'`
+
+#### Frontend logging (`frontend/src/utils/logger.js`)
+- `createLogger(module)` factory returns `{ info, warn, error, debug, group }`
+- Each method prefixes with `🧬 ProteinFriend [ModuleName]` + emoji indicator
+- Module-specific loggers exported: `apiLogger`, `searchLogger`, `graphLogger`,
+  `proteinLogger`, `paperLogger`, `filterLogger`, `appLogger`, `contextLogger`
+- All components and services use their dedicated logger
+- **No `console.log`/`console.error` anywhere** — all use the structured logger
+
+**Console format:** `🧬 ProteinFriend [API] ℹ️ Searching protein: "p53"`
+
+### 16.5 Frontend design implementation details
+
+#### Dark mode theme (`frontend/src/App.js`)
+- MUI `createTheme` with `palette.mode: 'dark'`
+- Background: `#0D0D1A` (deep navy-black) with subtle radial gradient glows
+- Surface: `#1A1A2E` panels with `backdrop-filter: blur(20px)`
+- Primary: `#6C63FF` (vibrant purple) with gradient buttons and glow effects
+- Secondary: `#FF6584` (coral pink) for accents
+- Text: `#E8E8F0` primary, `#A0A0B8` secondary
+- All MUI components have `styleOverrides` for consistent dark styling
+- Typography: Inter font family, proper letter spacing
+
+#### Graph visualization enhancements (`frontend/src/components/GraphVisualization.js`)
+- **Colour-coded nodes by depth level**: purple (#6C63FF) → teal (#4ECDC4) → gold (#F7DC6F) → lavender (#BB8FCE) → sky blue (#85C1E9)
+- **Glowing shadows** on nodes matching their color
+- **Bold labels** with dark stroke (#0D0D1A) for readability
+- **Center node larger** (36px) with progressive sizing
+- **Cubic Bezier edges** with purple tint
+- **Custom CSS tooltips** with dark background and blur
+- **Depth legend** at bottom-left showing color-to-level mapping
+- **Zoom/Reset/Export** controls at top-right
+- Custom node styling via `Network` DataSet with shadow, borderWidth, font config
+
+#### Component styling patterns
+- All panels use `Paper` with dark background (`rgba(26, 26, 46, 0.8)`) and `backdrop-filter: blur(20px)`
+- Consistent border: `1px solid rgba(255,255,255,0.06)`
+- Search bar: glass-morphism card with purple search icon
+- Filter controls: styled checkboxes, active filter chips, depth display
+- Protein/Paper panels: right/left drawers with slide-in animations, uppercase section labels
+- Buttons: gradient backgrounds, hover lift effects, consistent border-radius 10px
+
+#### CSS animations (`frontend/src/index.css`)
+- `@keyframes fadeIn`, `slideInRight`, `slideInLeft`, `spin`, `pulse`
+- Custom scrollbar: 6px width, purple-tinted thumb
+- `::selection` styled with purple tint
+- `@keyframes spin` for the loading spinner (replaces MUI CircularProgress)
+
+### 16.6 Known issues and limitations
+
+1. **Depth slider is cosmetic** (gap 4.1 in spec). `get_graph` always does a single
+   `collect_interactions(root)` call. The graph is always one ring deep regardless
+   of depth setting. Fix requires implementing `CrawlService` (§8.5).
+
+2. **`PROTEIN_LLM_ALLOW_PLACEHOLDER_FALLBACK=0`** in `.env` is dead config —
+   read nowhere in the code. The placeholder backend was deliberately removed.
+   Safe to remove from `.env`.
+
+3. **`run_async` is `asyncio.run` per Flask request** — creates a new event loop
+   every time. This works but is inefficient. The `AsyncRateLimiter` and
+   `llm_service._pace_lock` work around this but it's a known issue (gap 6.1).
+
+4. **In-memory cache only** — `SimpleCache` is a dict that's lost on restart.
+   No SQLite persistence.
+
+5. **No full-text fetching** — only abstracts are read. `MAX_ABSTRACTS_FOR_EXTRACTION`
+   defaults to 20, so 30 of 50 fetched papers are silently discarded.
+
+6. **Frontend MUI theme** has `success`, `warning`, `error`, `info` as
+   `{ main: '#...' }` objects — this was required because MUI's `augmentColor`
+   needs a `main` property. Plain string values cause the error reported
+   earlier.
+
+### 16.7 What to implement next (per WORKFLOW_SPEC.md)
+
+The highest-priority remaining work, in order:
+
+1. **Phase 6: `CrawlService`** — Makes the depth slider actually work by
+   implementing BFS iteration (§8.5, §14.1)
+2. **Phase 1: SQLite layer** — Persistence so cache survives restart (§7, §14.8)
+3. **Phase 2: Interaction model** — Directed edges, subtypes, Evidence (§6, §14.3-14.4)
+4. **Phase 3: Name expansion** — Cross-organism ortholog lookup (§8.2, §14.5)
+5. **Phase 10: Frontend async crawl** — Progress display, polling (§11, §11.2-11.4)
+
+### 16.8 Environment variables reference
+
+Current `.env` contains:
+```
+PROTEIN_LLM_API_KEY=gsk_REDACTED
+PROTEIN_LLM_ALLOW_PLACEHOLDER_FALLBACK=0  # DEAD — not read anywhere
+NCBI_EMAIL=
+NCBI_API_KEY=
+```
+
+Used by code:
+- `PROTEIN_LLM_API_KEY` → `llm_service.py` builds Groq backend
+- `PROTEIN_LLM_BACKEND` / `PROTEIN_LLM_MODEL` / `PROTEIN_LLM_BASE_URL` → optional
+- `PROTEIN_LLM_ABSTRACT_CHARS` → default 1500 chars per abstract
+- `PROTEIN_LLM_MAX_TOKENS` → default 1200 max tokens per extraction
+- `PROTEIN_LLM_MIN_INTERVAL` → default 0.6s between LLM calls
+- `PROTEIN_LLM_MAX_ABSTRACTS` → default 20 per node (legacy name)
+- `NCBI_EMAIL` → Entrez email for PubMed API
+- `NCBI_API_KEY` → Optional NCBI API key
+
+### 16.9 Key file contents reference
+
+#### `app/utils/logger.py` — Key functions
+```python
+setup_logging(level=logging.INFO, show_timestamp=True)  # Called on import
+# logger = logging.getLogger(__name__)  # Use in each module
+```
+
+#### `app/__init__.py` — Startup sequence
+```python
+from app.utils.logger import setup_logging
+setup_logging(level=logging.INFO)  # Configures root logger
+# Then: Flask app creation, CORS, blueprint registration
+```
+
+#### `frontend/src/utils/logger.js` — Logger creation
+```javascript
+const logger = createLogger('MyModule');  // Returns { info, warn, error, debug, group }
+logger.info('Message', ...args);   // console.info with prefix
+logger.error('Message', err);       // console.error with prefix
+logger.debug('Message', ...args);   // console.debug with prefix
+```
+
+#### `app/routes.py` — Endpoint list
+```
+POST   /api/search          — Resolve protein by name/symbol/accession
+GET    /api/protein/<id>    — Detailed protein info
+POST   /api/interactions    — Get interactions for a protein
+GET    /api/papers/<pmid>   — Get paper details
+POST   /api/graph           — Build interaction graph
+GET    /api/health          — Health check
+DELETE /api/cache           — Clear cache
+```
+
+---
+
+## End of WORKFLOW_SPEC.md
+
+*Last updated: 2026-09-26. All claims verified by reading the actual source files.*
+*Structure logging implemented across all Python backend modules and React frontend components.
+Dark mode redesign applied to all frontend components.*

@@ -29,17 +29,17 @@ DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 #   curl -H "Authorization: Bearer $PROTEIN_LLM_API_KEY" ^
 #        https://api.groq.com/openai/v1/models
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
-
-# Extraction only needs the opening of an abstract; sending all 2,000+
+  
+# Extraction only needs the opening of an abstract; s ending all 2,000+
 # characters of 50 abstracts blows through free-tier token limits.
-ABSTRACT_CHARS = int(os.environ.get("PROTEIN_LLM_ABSTRACT_CHARS", "1500"))
+ABSTRACT_CHARS = int(os.environ.get("PROTEIN_LLM_ABSTRACT_CHARS", "1000"))
 
-# Reasoning models (gpt-oss, o-series, most local models) spend tokens on
+# Reasoning models (gpt-oss, o-serie s, most local models) spend tokens on
 # hidden reasoning BEFORE emitting JSON. gpt-oss-120b used 145 reasoning
 # tokens for a one-sentence answer, so a 400-token cap made it fail with
 # "max completion tokens reached before generating a valid json object".
 # The cap is a ceiling, not a cost -- billing follows tokens actually used.
-EXTRACTION_MAX_TOKENS = int(os.environ.get("PROTEIN_LLM_MAX_TOKENS", "1200"))
+EXTRACTION_MAX_TOKENS = int(os.environ.get("PROTEIN_LLM_MAX_TOKENS", "2048"))
 
 NOT_CONFIGURED_MESSAGE = (
     "No LLM configured. Set PROTEIN_LLM_API_KEY in .env (Groq is assumed) to "
@@ -265,6 +265,22 @@ Abstract:
 Respond with JSON only, no commentary:
 {{"interactions": [{{"source_protein": "TP53", "target_protein": "MDM2", "interaction_type": "physical_binding", "context": "short quote"}}]}}"""
 
+    CONNECTION_SUMMARY_PROMPT = """You are a biomedical interaction summarizer.
+
+Task: Based on the following information about a protein-protein interaction,
+generate a concise 2-3 sentence summary that explains:
+1. What the connection does (the biological relationship)
+2. What the papers say about this connection (key findings)
+
+Connection details:
+- Proteins: {source_protein} and {target_protein}
+- Interaction type: {interaction_type}
+- Supporting papers: {paper_titles}
+- Evidence/context: {context}
+
+Respond with JSON only:
+{{{"summary": "...", "what_it_does": "...", "paper_evidence": "..."}}}}"""
+
     SUMMARY_PROMPT = """In 2-3 sentences each, describe the following about {protein}:
 1. function
 2. pathways
@@ -452,6 +468,50 @@ Return JSON only:
             logger.error(
                 "Protein description generation FAILED for '%s': %s",
                 protein_name, exc,
+                exc_info=True,
+            )
+            return {}
+
+    async def generate_connection_summary(self, source_protein: str, target_protein: str,
+                                           interaction_type: str, paper_titles: str,
+                                           context: str = None) -> Dict:
+        """Generate a summary of what a protein-protein connection does
+        and what the papers say about it."""
+        if not self.is_configured:
+            logger.info(
+                "generate_connection_summary skipped: LLM not configured"
+            )
+            return {}
+        self._stats["attempts"] += 1
+        logger.info(
+            "Generating connection summary: %s - %s (%s)",
+            source_protein, target_protein, interaction_type,
+        )
+        try:
+            raw = await self.backend.complete(
+                self.CONNECTION_SUMMARY_PROMPT.format(
+                    source_protein=source_protein,
+                    target_protein=target_protein,
+                    interaction_type=interaction_type,
+                    paper_titles=paper_titles,
+                    context=context or "No context available",
+                ),
+                max_tokens=400,
+            )
+            data = self._load_json(raw)
+            self._stats["succeeded"] += 1
+            logger.info(
+                "Connection summary generated: %s - %s",
+                source_protein, target_protein,
+            )
+            return data
+        except Exception as exc:
+            self._stats["failed"] += 1
+            self._stats["last_error"] = str(exc)[:500]
+            self._stats["degraded"] = True
+            logger.error(
+                "Connection summary FAILED for %s-%s: %s",
+                source_protein, target_protein, exc,
                 exc_info=True,
             )
             return {}

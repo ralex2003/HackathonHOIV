@@ -68,29 +68,39 @@ function GraphVisualization() {
     }
   }, [state.graphData, nodes.length, edges.length, logger]);
 
-  const handleSelect = useCallback(
-    (params) => {
-      if (params.edges && params.edges.length > 0) {
-        const edge = edgeById.get(params.edges[0]);
-        if (edge) {
-          logger.debug(`Edge selected: ${edge.from} → ${edge.to} (${edge.label})`);
-          dispatch({ type: 'SET_SELECTED_EDGE', payload: edge });
-          dispatch({ type: 'SET_PAPERS', payload: edge.papers || [] });
-          setPaperListOpen(true);
-          return;
-        }
-      }
+  // The protein panel and the connection panel are mutually exclusive. Both are
+  // MUI Modals, so if two are open at once the later-mounted one (the
+  // connection panel) stacks its backdrop on top of the protein panel and
+  // traps focus -- the protein description becomes invisible. Each handler
+  // therefore tears the other one down.
+  const handleNodeSelect = useCallback(
+    (nodeId) => {
+      const node = nodeById.get(nodeId);
+      if (!node) return;
 
-      if (params.nodes && params.nodes.length > 0) {
-        const node = nodeById.get(params.nodes[0]);
-        if (node) {
-          logger.debug(`Node selected: ${node.label || node.id}`);
-          dispatch({ type: 'SET_SELECTED_NODE', payload: node });
-          setProteinDetailsOpen(true);
-        }
-      }
+      logger.debug(`Node selected: ${node.label || node.id}`);
+      dispatch({ type: 'SET_SELECTED_NODE', payload: node });
+      dispatch({ type: 'SET_SELECTED_EDGE', payload: null });
+      dispatch({ type: 'SET_PAPERS', payload: [] });
+      setPaperListOpen(false);
+      setProteinDetailsOpen(true);
     },
-    [dispatch, edgeById, nodeById, setProteinDetailsOpen, setPaperListOpen, logger]
+    [dispatch, nodeById, setPaperListOpen, setProteinDetailsOpen, logger]
+  );
+
+  const handleEdgeSelect = useCallback(
+    (edgeId) => {
+      const edge = edgeById.get(edgeId);
+      if (!edge) return;
+
+      logger.debug(`Edge selected: ${edge.from} → ${edge.to} (${edge.label})`);
+      dispatch({ type: 'SET_SELECTED_EDGE', payload: edge });
+      dispatch({ type: 'SET_PAPERS', payload: edge.papers || [] });
+      dispatch({ type: 'SET_SELECTED_NODE', payload: null });
+      setProteinDetailsOpen(false);
+      setPaperListOpen(true);
+    },
+    [dispatch, edgeById, setProteinDetailsOpen, setPaperListOpen, logger]
   );
 
   useEffect(() => {
@@ -157,38 +167,42 @@ function GraphVisualization() {
     });
 
     // Build styled edges
-    const styledEdges = edges.map((edge) => ({
-      ...edge,
-      color: {
-        color: 'rgba(108, 99, 255, 0.4)',
-        highlight: '#6C63FF',
-        hover: '#8B85FF',
-        opacity: 0.6,
-      },
-      width: 2,
-      smooth: {
-        type: 'cubicBezier',
-        roundness: 0.35,
-      },
-      font: {
-        color: '#A0A0B8',
-        size: 10,
-        face: 'Inter, sans-serif',
-        align: 'middle',
-        background: 'rgba(13, 13, 26, 0.8)',
-        strokeWidth: 2,
-        strokeColor: '#0D0D1A',
-      },
-      arrows: {
-        to: {
-          enabled: true,
-          scaleFactor: 0.6,
-          type: 'arrow',
+    const styledEdges = edges.map((edge) => {
+      const isSkipping = edge.level_skipping;
+      return {
+        ...edge,
+        color: {
+          color: isSkipping ? 'rgba(255, 165, 0, 0.4)' : 'rgba(108, 99, 255, 0.4)',
+          highlight: isSkipping ? '#FFA500' : '#6C63FF',
+          hover: isSkipping ? '#FFB833' : '#8B85FF',
+          opacity: 0.6,
         },
-      },
-      selectionWidth: 3,
-      hoverWidth: 3,
-    }));
+        width: isSkipping ? 3 : 2,
+        dashed: isSkipping,
+        smooth: {
+          type: 'cubicBezier',
+          roundness: 0.35,
+        },
+        font: {
+          color: isSkipping ? '#FFA500' : '#A0A0B8',
+          size: 10,
+          face: 'Inter, sans-serif',
+          align: 'middle',
+          background: 'rgba(13, 13, 26, 0.8)',
+          strokeWidth: 2,
+          strokeColor: '#0D0D1A',
+        },
+        arrows: {
+          to: {
+            enabled: true,
+            scaleFactor: 0.6,
+            type: 'arrow',
+          },
+        },
+        selectionWidth: 3,
+        hoverWidth: 3,
+      };
+    });
 
     const options = {
       nodes: {
@@ -217,24 +231,22 @@ function GraphVisualization() {
         hoverWidth: 3,
         selectionWidth: 3,
       },
-      physics: {
-        stabilization: {
-          iterations: 200,
-          updateInterval: 25,
+      layout: {
+        hierarchical: {
           enabled: true,
-        },
-        barnesHut: {
-          gravitationalConstant: -2500,
-          centralGravity: 0.3,
-          springLength: 180,
-          springConstant: 0.04,
-          damping: 0.09,
-          avoidCollision: 20,
-        },
-        maxVelocity: 15,
-        solver: 'barnesHut',
-        timestep: 0.5,
-        wind: { x: 0, y: 0 },
+          direction: 'DU',           // down: root at top, children below
+          sortMethod: 'directed',    // respect edge direction for level assignment
+          levelSeparation: 160,      // vertical gap between levels
+          nodeSpacing: 120,          // horizontal gap between nodes in same level
+          treeSpacing: 250,          // gap between subtrees
+          blockShifting: true,       // shift blocks to minimize edge crossings
+          edgeMinimization: true,    // minimize edge crossings
+          shakeTowards: 'roots',     // keep roots near the top
+          parentCentralization: true,
+        }
+      },
+      physics: {
+        enabled: false,   // disable force-directed; hierarchical handles positioning
       },
       interaction: {
         hover: true,
@@ -248,12 +260,9 @@ function GraphVisualization() {
         dragNodes: true,
         dragView: true,
         zoomView: true,
+        selectConnectedEdges: false,
       },
       groups: {},
-      layout: {
-        improvedLayout: true,
-      },
-      // Configure the tooltip styling
       configure: {
         enabled: false,
       },
@@ -268,7 +277,12 @@ function GraphVisualization() {
       options
     );
     networkInstance.current = network;
-    network.on('click', handleSelect);
+    // selectNode/selectEdge are mutually exclusive by construction. The
+    // generic 'click' event is not: its payload can carry both nodes and edges
+    // when a click lands near an edge, which is how a protein click ended up
+    // opening the connection summary.
+    network.on('selectNode', (params) => handleNodeSelect(params.nodes[0]));
+    network.on('selectEdge', (params) => handleEdgeSelect(params.edges[0]));
 
     // Configure tooltips via CSS
     const style = document.createElement('style');
@@ -310,7 +324,7 @@ function GraphVisualization() {
       }
       logger.debug("Network instance destroyed");
     };
-  }, [state.graphData, nodes, edges, handleSelect, logger]);
+  }, [state.graphData, nodes, edges, handleNodeSelect, handleEdgeSelect, logger]);
 
   const handleZoomIn = () => {
     if (networkInstance.current) {
@@ -425,6 +439,19 @@ function GraphVisualization() {
             </Typography>
           </Box>
         ))}
+        {/* Level-skipping edge indicator */}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5, ml: 2 }}>
+          <Box
+            sx={{
+              width: 20,
+              height: 0,
+              borderTop: '3px dashed #FFA500',
+            }}
+          />
+          <Typography variant="caption" sx={{ color: '#A0A0B8', fontSize: '0.65rem' }}>
+            long-range
+          </Typography>
+        </Box>
       </Box>
     </Box>
   );

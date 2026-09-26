@@ -23,7 +23,7 @@ function PaperListPanel() {
   const logger = paperLogger;
 
   const handleClose = () => {
-    logger.debug("Closing paper list panel");
+    logger.debug("Closing connection panel");
     setPaperListOpen(false);
     dispatch({ type: 'SET_SELECTED_EDGE', payload: null });
     dispatch({ type: 'SET_PAPERS', payload: [] });
@@ -31,12 +31,9 @@ function PaperListPanel() {
 
   const loadPaperDetails = async (pmid) => {
     if (paperDetails[pmid]) return;
-
-    logger.debug(`Loading paper details: PMID=${pmid}`);
     try {
       const paper = await getPaper(pmid);
       setPaperDetails((prev) => ({ ...prev, [pmid]: paper }));
-      logger.info(`Paper loaded: ${paper.title?.slice(0, 50) || pmid}`);
     } catch (error) {
       logger.error(`Error loading paper PMID=${pmid}:`, error);
     }
@@ -44,7 +41,6 @@ function PaperListPanel() {
 
   useEffect(() => {
     if (state.papers.length > 0) {
-      logger.info(`Loading details for ${state.papers.length} papers`);
       state.papers.forEach((pmid) => loadPaperDetails(pmid));
     }
   }, [state.papers]);
@@ -52,7 +48,6 @@ function PaperListPanel() {
   if (!state.selectedEdge) return null;
 
   const edge = state.selectedEdge;
-  const accentColor = '#6C63FF';
 
   return (
     <Drawer
@@ -60,10 +55,10 @@ function PaperListPanel() {
       open={paperListOpen}
       onClose={handleClose}
       sx={{
-        width: 400,
+        width: 420,
         flexShrink: 0,
         '& .MuiDrawer-paper': {
-          width: 400,
+          width: 420,
           boxSizing: 'border-box',
           background: 'rgba(26, 26, 46, 0.95)',
           backdropFilter: 'blur(20px)',
@@ -76,49 +71,120 @@ function PaperListPanel() {
         {/* Header */}
         <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
           <Typography variant="h5" sx={{ color: '#E8E8F0', fontWeight: 700 }}>
-            📄 Related Papers
+            🔗 Connection Summary
           </Typography>
-          <IconButton
-            onClick={handleClose}
-            size="small"
-            sx={{
-              backgroundColor: 'rgba(255,255,255,0.05)',
-              border: '1px solid rgba(255,255,255,0.1)',
-            }}
-          >
+          <IconButton onClick={handleClose} size="small"
+            sx={{ backgroundColor: 'rgba(255,255,255,0.05)', border: '1px solid rgba(255,255,255,0.1)' }}>
             <Close sx={{ color: '#A0A0B8' }} />
           </IconButton>
         </Box>
 
         <Divider sx={{ mb: 2 }} />
 
-        {/* Edge info */}
+        {/* Connection summary */}
         <Paper
           sx={{
-            p: 2,
+            p: 2.5,
             mb: 2,
             backgroundColor: 'rgba(108, 99, 255, 0.08)',
             border: '1px solid rgba(108, 99, 255, 0.15)',
             borderRadius: 2,
           }}
         >
-          <Typography variant="body2" sx={{ color: '#E8E8F0', fontFamily: 'monospace', fontSize: '0.85rem' }}>
-            {edge.from} → {edge.to}
+          {/* Proteins involved */}
+          <Typography variant="h6" sx={{ color: '#E8E8F0', fontWeight: 700, fontSize: '1rem', mb: 1 }}>
+            {edge.from} ↔ {edge.to}
           </Typography>
-          <Chip
-            label={`${edge.paper_count} paper${edge.paper_count !== 1 ? 's' : ''}`}
-            size="small"
-            sx={{
-              mt: 1,
-              backgroundColor: 'rgba(78, 205, 196, 0.15)',
-              border: '1px solid rgba(78, 205, 196, 0.3)',
-              color: '#4ECDC4',
-              fontSize: '0.75rem',
-            }}
-          />
+
+          <Box sx={{ display: 'flex', gap: 1, mt: 1, flexWrap: 'wrap', mb: 1.5 }}>
+            <Chip
+              label={edge.label || edge.interaction_type}
+              size="small"
+              sx={{
+                backgroundColor: edge.level_skipping
+                  ? 'rgba(255, 165, 0, 0.15)'
+                  : 'rgba(78, 205, 196, 0.15)',
+                border: `1px solid ${edge.level_skipping ? 'rgba(255, 165, 0, 0.3)' : 'rgba(78, 205, 196, 0.3)'}`,
+                color: edge.level_skipping ? '#FFA500' : '#4ECDC4',
+                fontSize: '0.75rem',
+              }}
+            />
+            {edge.level_skipping && (
+              <Chip
+                label="long-range"
+                size="small"
+                sx={{
+                  backgroundColor: 'rgba(255, 165, 0, 0.1)',
+                  border: '1px solid rgba(255, 165, 0, 0.2)',
+                  color: '#FFA500',
+                  fontSize: '0.7rem',
+                }}
+              />
+            )}
+            <Chip
+              label={`${edge.paper_count} paper${edge.paper_count !== 1 ? 's' : ''}`}
+              size="small"
+              sx={{
+                backgroundColor: 'rgba(247, 220, 111, 0.15)',
+                border: '1px solid rgba(247, 220, 111, 0.3)',
+                color: '#F7DC6F',
+                fontSize: '0.75rem',
+              }}
+            />
+          </Box>
+
+          {/* Evidence / context */}
+          {edge.context && (
+            <Paper
+              sx={{
+                mt: 1.5,
+                p: 2,
+                backgroundColor: 'rgba(13, 13, 26, 0.6)',
+                border: '1px solid rgba(255,255,255,0.06)',
+                borderRadius: 1,
+                borderLeft: '3px solid #6C63FF',
+              }}
+            >
+              <Typography variant="caption" sx={{ color: '#A0A0B8', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.08em', display: 'block', mb: 0.5 }}>
+                Evidence / Context
+              </Typography>
+              <Typography variant="body2" sx={{ color: '#E8E8F0', lineHeight: 1.6, fontSize: '0.85rem', fontStyle: 'italic' }}>
+                "{edge.context}"
+              </Typography>
+            </Paper>
+          )}
+
+          {/* Multiple contexts from different papers */}
+          {edge.contexts && edge.contexts.length > 1 && (
+            <Box sx={{ mt: 1.5 }}>
+              <Typography variant="caption" sx={{ color: '#A0A0B8', fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.08em', display: 'block', mb: 1 }}>
+                Supporting Evidence ({edge.contexts.length} papers)
+              </Typography>
+              {edge.contexts.map((ctx, i) => (
+                <Paper
+                  key={i}
+                  sx={{
+                    mt: 1,
+                    p: 1.5,
+                    backgroundColor: 'rgba(13, 13, 26, 0.4)',
+                    border: '1px solid rgba(255,255,255,0.04)',
+                    borderRadius: 1,
+                    borderLeft: '2px solid #4ECDC4',
+                  }}
+                >
+                  <Typography variant="caption" sx={{ color: '#6B6B80', fontSize: '0.7rem', fontStyle: 'italic', lineHeight: 1.4 }}>
+                    "{ctx}"
+                  </Typography>
+                </Paper>
+              ))}
+            </Box>
+          )}
         </Paper>
 
         {/* Paper list */}
+        <Typography variant="subtitle2" sx={{ color: '#A0A0B8', mb: 1.5, fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.08em' }}>
+          Supporting Papers
+        </Typography>
         <List sx={{ pt: 0 }}>
           {state.papers.map((pmid) => {
             const paper = paperDetails[pmid];
@@ -148,14 +214,8 @@ function PaperListPanel() {
                       rel="noopener noreferrer"
                       underline="none"
                       sx={{
-                        color: '#8B85FF',
-                        fontWeight: 500,
-                        fontSize: '0.9rem',
-                        lineHeight: 1.4,
-                        '&:hover': {
-                          color: '#6C63FF',
-                          textDecoration: 'none',
-                        },
+                        color: '#8B85FF', fontWeight: 500, fontSize: '0.9rem', lineHeight: 1.4,
+                        '&:hover': { color: '#6C63FF', textDecoration: 'none' },
                       }}
                     >
                       {paper?.title || `Paper ${pmid}`}
@@ -167,31 +227,19 @@ function PaperListPanel() {
                         {paper?.year || 'Unknown year'}
                       </Typography>
                       {paper?.abstract && (
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            display: 'block',
-                            mt: 0.5,
-                            color: '#6B6B80',
-                            fontSize: '0.7rem',
-                            lineHeight: 1.4,
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            display: '-webkit-box',
-                            WebkitLineClamp: 2,
-                            WebkitBoxOrient: 'vertical',
-                          }}
-                        >
+                        <Typography variant="caption" sx={{
+                          display: 'block', mt: 0.5, color: '#6B6B80',
+                          fontSize: '0.7rem', lineHeight: 1.4,
+                          overflow: 'hidden', textOverflow: 'ellipsis',
+                          display: '-webkit-box', WebkitLineClamp: 2,
+                          WebkitBoxOrient: 'vertical',
+                        }}>
                           {paper.abstract.slice(0, 120)}...
                         </Typography>
                       )}
                     </Box>
                   }
-                  sx={{
-                    '& .MuiListItemText-primary': {
-                      fontSize: '0.9rem',
-                    },
-                  }}
+                  sx={{ '& .MuiListItemText-primary': { fontSize: '0.9rem' } }}
                 />
               </ListItem>
             );
