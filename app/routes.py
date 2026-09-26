@@ -105,7 +105,35 @@ async def _crawl_node(
     cached = cache.get(cache_key)
     if cached is not None:
         logger.info("Node cache HIT for %s", protein.node_id)
-        return cached
+        # A HIT must reproduce the `seen` mutation the original crawl made,
+        # otherwise the caller sees `visited - before == empty` and builds an
+        # empty frontier -- i.e. depth>1 silently collapses to depth=1 on
+        # every repeat query. New cache entries store the claimed symbols as
+        # a 4th tuple element; older 3-tuple entries fall back to deriving
+        # them from the cached edges.
+        if len(cached) == 4:
+            interactions_c, papers_c, meta_c, new_symbols_c = cached
+        else:
+            interactions_c, papers_c, meta_c = cached
+            symbol_c = protein.node_id
+            new_symbols_c = []
+            for inter_c in interactions_c:
+                far_c = (
+                    inter_c.target_protein
+                    if inter_c.source_protein == symbol_c
+                    else inter_c.source_protein
+                )
+                if far_c and far_c != symbol_c and far_c not in new_symbols_c:
+                    new_symbols_c.append(far_c)
+        fresh = [s for s in new_symbols_c if s and s not in seen]
+        for s in fresh:
+            seen.add(s)
+        meta_hit = dict(meta_c)
+        meta_hit["cache_hit"] = True
+        # `new_partners` describes this crawl, not the original one: symbols
+        # already claimed by an earlier sibling contribute no fresh frontier.
+        meta_hit["new_partners"] = len(fresh)
+        return interactions_c, papers_c, meta_hit
 
     logger.info("Node crawl: protein='%s', searching PubMed...", protein.node_id)
     query = pubmed_service.build_query(terms)
@@ -218,9 +246,11 @@ async def _crawl_node(
     # Only cache a result that actually spent its budget. A partial crawl is
     # a function of how much was already known when it ran, so serving it
     # later against a different `seen` set would be wrong.
+    # The 4th element (claimed symbols) is cache-only: the caller contract
+    # stays a 3-tuple, but a HIT needs these to rebuild the frontier.
     complete = novel_kept >= edge_limit or used >= MAX_ABSTRACTS_FOR_EXTRACTION
     if complete:
-        cache.set(cache_key, result)
+        cache.set(cache_key, (list(merged.values()), papers, meta, sorted(new_symbols)))
     else:
         logger.info(
             "Node %s: partial crawl (%d/%d new partners) not cached",
@@ -320,7 +350,9 @@ async def collect_interactions(
 
             # `visited` already contains everything this node claimed, so
             # whatever it added is exactly the new frontier material.
-            for symbol in visited - before:
+            # (A node served from cache re-claims its symbols inside
+            # `_crawl_node`, so this works for HITs as well as fresh crawls.)
+            for symbol in sorted(visited - before):
                 resolved = await protein_service.get_protein_by_name(symbol)
                 if resolved:
                     next_frontier_proteins.append(resolved)

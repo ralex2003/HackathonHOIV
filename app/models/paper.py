@@ -16,7 +16,7 @@ class Paper:
     def __post_init__(self):
         if self.url is None:
             self.url = f"https://pubmed.ncbi.nlm.nih.gov/{self.pmid}/"
-        if not self.author_list and self.authors:
+        if not self.author_list and self.authors: 
             self.author_list = [a.strip() for a in self.authors.split(",") if a.strip()]
 
     def to_dict(self, include_abstract: bool = True) -> dict:
