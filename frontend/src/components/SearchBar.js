@@ -187,9 +187,10 @@ function SearchBar() {
         sx={{ color: '#6A6A85', display: 'block', mt: 1, px: 1 }}
       >
         Each protein contributes up to {localEdgesPerNode} NEW partners of its
-        own, so every layer grows {localEdgesPerNode}× wider. Extra edges back
-        to proteins already in the graph are still kept, but don't count
-        toward this number.
+        own, so every layer grows {localEdgesPerNode}× wider. Papers are
+        fetched in batches until each quota fills, so higher values take
+        longer. Extra edges back to proteins already in the graph are still
+        kept, but don't count toward this number.
       </Typography>
     </Box>
   );

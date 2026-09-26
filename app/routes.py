@@ -1,7 +1,7 @@
 import asyncio
 import os
 import logging
-from typing import List, Tuple, Set, Dict
+from typing import List, Tuple, Set, Dict, Optional
 from collections import deque
 
 from flask import Blueprint, jsonify, request
@@ -31,8 +31,21 @@ MAX_PAPERS = 5
 MAX_ABSTRACTS_FOR_EXTRACTION = int(
     os.environ.get("PROTEIN_LLM_MAX_ABSTRACTS", "5")
 )
-# Total cap on LLM calls across ALL levels of the crawl.  
-# At 3 abstracts per node and 2 levels, that's ~9 calls max for depth=2.
+# Adaptive paper budget per node: how many PubMed papers to consider per
+# requested edge, and the hard ceiling per node. Papers are fetched in
+# MAX_PAPERS-sized batches and extraction stops as soon as the node's edge
+# budget is filled, so a node that finds all its partners in the first batch
+# costs exactly as before -- but a node whose first papers yield nothing
+# keeps fetching instead of stalling. Previously this was a flat `max_papers`
+# (5) papers per node no matter how high the edge slider went, so
+# edges_per_node=15 could never yield more than ~5 abstracts' worth of
+# partners (measured: ~0.4 novel partners per abstract).
+PAPERS_PER_EDGE = int(os.environ.get("PROTEIN_PAPERS_PER_EDGE", "3"))
+MAX_PAPERS_PER_NODE = int(os.environ.get("PROTEIN_MAX_PAPERS_PER_NODE", "60"))
+# Total cap on LLM calls across ALL levels of the crawl.
+# Per-node paper fetching is adaptive (up to PAPERS_PER_EDGE papers per
+# requested edge), so this backstop is what bounds the worst case:
+# depth=2, edges_per_node=15 can cost ~6 nodes x 45 abstracts without it.
 # New interactions kept per crawled node. Deliberately a PER-NODE budget: a
 # node discovered at level 3 gets the same allowance as the root, so `depth`
 # actually controls how much of the graph gets explored.
@@ -97,9 +110,14 @@ async def _crawl_node(
         }
 
     # edge_limit is part of the key: a node crawled with a limit of 5 must not
-    # be served from a cache entry built with a limit of 25.
+    # be served from a cache entry built with a limit of 25. search_size is
+    # derived from edge_limit, so it is included for the same reason.
+    search_size = min(
+        max(edge_limit * PAPERS_PER_EDGE, max_papers, MAX_ABSTRACTS_FOR_EXTRACTION),
+        MAX_PAPERS_PER_NODE,
+    )
     cache_key = (
-        f"node:{protein.uniprot_id}:{max_papers}:{edge_limit}:"
+        f"node:{protein.uniprot_id}:{max_papers}:{edge_limit}:{search_size}:"
         f"{llm_service.is_configured}"
     )
     cached = cache.get(cache_key)
@@ -137,104 +155,138 @@ async def _crawl_node(
 
     logger.info("Node crawl: protein='%s', searching PubMed...", protein.node_id)
     query = pubmed_service.build_query(terms)
-    pmids = await pubmed_service.search_papers(query, max_results=max_papers)
-    papers = await pubmed_service.fetch_multiple_papers(pmids)
+    # One relevance-ranked search up to the adaptive budget, then fetch in
+    # batches and stop early once the edge budget fills. Batching matters:
+    # fetching all `search_size` papers upfront would download dozens of
+    # papers a lucky node never needs.
+    pmids = await pubmed_service.search_papers(query, max_results=search_size)
 
     symbol = protein.node_id
     merged: dict = {}
     used = 0
+    llm_errors = 0
     sources: dict = {}
     offered = 0          # interactions the LLM proposed, before capping
     novel_kept = 0       # kept edges whose far endpoint was NOT already seen
     redundant_kept = 0   # kept edges pointing back into the existing graph
-    dropped_by_cap = 0   # proposed but over this node's novel budget
+    dropped_by_cap = 0   # proposed but over this node's novel-partner budget
     new_symbols: Set[str] = set()
+    papers_all: List[Paper] = []
+    pmids_consumed = 0
+    batch_size = max(1, int(max_papers or MAX_PAPERS))
 
-    for paper in papers:
-        if not paper.abstract:
-            continue
-        # Budget spent: stop when this node has found `edge_limit` proteins
-        # that were NOT already in the graph. Edges pointing back at
-        # already-known proteins are still kept (they are real evidence) but
-        # they do not consume budget, because they cannot expand the frontier.
-        #
-        # This is the whole point: a per-node budget spent on *any* edge gets
-        # swallowed by re-links to existing nodes -- measured 5 novel vs 25
-        # redundant -- so the graph never grew past one ring no matter how
-        # high the depth slider went.
+    def _stop_reason() -> Optional[str]:
         if novel_kept >= edge_limit:
-            break
-        if used >= MAX_ABSTRACTS_FOR_EXTRACTION:
-            logger.info(
-                "Node %s hit abstract cap (%d) with only %d/%d NEW partners",
-                protein.node_id, MAX_ABSTRACTS_FOR_EXTRACTION, novel_kept, edge_limit,
-            )
-            break
+            return "edge_budget_filled"
+        if used >= search_size:
+            return "paper_budget_spent"
         if llm_budget_ref["count"] >= llm_budget_ref["max"]:
-            logger.warning("LLM budget exhausted at node %s", protein.node_id)
+            return "llm_budget_exhausted"
+        return None
+
+    for start in range(0, len(pmids), batch_size):
+        if _stop_reason() is not None:
             break
-
-        used += 1
-        llm_budget_ref["count"] += 1
-        logger.debug(
-            "Extracting interactions from PMID=%s for %s "
-            "(%d/%d max_llm=%d, %d/%d new partners so far)",
-            paper.pmid, protein.node_id,
-            llm_budget_ref["count"], llm_budget_ref["max"], llm_budget_ref["max"],
-            novel_kept, edge_limit,
-        )
-        extracted = await llm_service.extract_interactions(paper.abstract, symbol)
-        source = extracted.get("source", "unknown")
-        sources[source] = sources.get(source, 0) + 1
-        for item in extracted.get("interactions", []) or []:
-            src = item.get("source_protein")
-            tgt = item.get("target_protein")
-            if not src or not tgt or src == tgt:
+        batch_pmids = pmids[start:start + batch_size]
+        pmids_consumed += len(batch_pmids)
+        batch = await pubmed_service.fetch_multiple_papers(batch_pmids)
+        papers_all.extend(batch)
+        for paper in batch:
+            if not paper.abstract:
                 continue
-            offered += 1
-            interaction = Interaction(
-                source_protein=src,
-                target_protein=tgt,
-                interaction_type=Interaction.normalize_type(
-                    item.get("interaction_type", "")
-                ),
-                papers=[paper],
-                context=item.get("context"),
+            # Budget spent: stop when this node has found `edge_limit`
+            # proteins that were NOT already in the graph. Edges pointing
+            # back at already-known proteins are still kept (they are real
+            # evidence) but they do not consume budget, because they cannot
+            # expand the frontier.
+            #
+            # This is the whole point: a per-node budget spent on *any* edge
+            # gets swallowed by re-links to existing nodes -- measured 5
+            # novel vs 25 redundant -- so the graph never grew past one ring
+            # no matter how high the depth slider went.
+            reason = _stop_reason()
+            if reason is not None:
+                if reason == "paper_budget_spent":
+                    logger.info(
+                        "Node %s hit paper cap (%d) with only %d/%d NEW partners",
+                        protein.node_id, search_size, novel_kept, edge_limit,
+                    )
+                elif reason == "llm_budget_exhausted":
+                    logger.warning("LLM budget exhausted at node %s", protein.node_id)
+                break
+
+            used += 1
+            llm_budget_ref["count"] += 1
+            logger.debug(
+                "Extracting interactions from PMID=%s for %s "
+                "(%d/%d max_llm=%d, %d/%d new partners so far)",
+                paper.pmid, protein.node_id,
+                llm_budget_ref["count"], llm_budget_ref["max"], llm_budget_ref["max"],
+                novel_kept, edge_limit,
             )
-            key = interaction.key()
-            if key in merged:
-                # Free: no extra LLM call, and it strengthens the evidence on
-                # an edge we already kept. Always allowed.
-                merged[key].merge(interaction)
-                continue
+            extracted = await llm_service.extract_interactions(paper.abstract, symbol)
+            source = extracted.get("source", "unknown")
+            sources[source] = sources.get(source, 0) + 1
+            if source == "error":
+                llm_errors += 1
+            for item in extracted.get("interactions", []) or []:
+                src = item.get("source_protein")
+                tgt = item.get("target_protein")
+                if not src or not tgt or src == tgt:
+                    continue
+                offered += 1
+                interaction = Interaction(
+                    source_protein=src,
+                    target_protein=tgt,
+                    interaction_type=Interaction.normalize_type(
+                        item.get("interaction_type", "")
+                    ),
+                    papers=[paper],
+                    context=item.get("context"),
+                )
+                key = interaction.key()
+                if key in merged:
+                    # Free: no extra LLM call, and it strengthens the evidence
+                    # on an edge we already kept. Always allowed.
+                    merged[key].merge(interaction)
+                    continue
 
-            # Novelty test: which endpoint is the neighbour, from this node?
-            far = tgt if src == symbol else src
-            already = far in seen
-            if already:
-                # A re-link into the existing graph. Keep it -- it is genuine
-                # evidence and costs nothing -- but do not spend budget on it.
-                merged[key] = interaction
-                redundant_kept += 1
-            elif novel_kept < edge_limit:
-                merged[key] = interaction
-                novel_kept += 1
-                new_symbols.add(far)
-                # Claim it immediately so a sibling node cannot spend its
-                # budget re-discovering the same protein.
-                seen.add(far)
-            else:
-                # Over this node's novel-partner budget. Counted and reported
-                # rather than silently dropped.
-                dropped_by_cap += 1
+                # Novelty test: which endpoint is the neighbour, from this node?
+                far = tgt if src == symbol else src
+                already = far in seen
+                if already:
+                    # A re-link into the existing graph. Keep it -- it is
+                    # genuine evidence and costs nothing -- but do not spend
+                    # budget on it.
+                    merged[key] = interaction
+                    redundant_kept += 1
+                elif novel_kept < edge_limit:
+                    merged[key] = interaction
+                    novel_kept += 1
+                    new_symbols.add(far)
+                    # Claim it immediately so a sibling node cannot spend its
+                    # budget re-discovering the same protein.
+                    seen.add(far)
+                else:
+                    # Over this node's novel-partner budget. Counted and
+                    # reported rather than silently dropped.
+                    dropped_by_cap += 1
+
+    stop = _stop_reason()
+    if stop == "llm_budget_exhausted":
+        logger.warning("LLM budget exhausted at node %s", protein.node_id)
+    pmids_exhausted = pmids_consumed >= len(pmids)
 
     meta = {
         "query": query,
         "total_pmids": len(pmids),
-        "papers_fetched": len(papers),
+        "papers_fetched": len(papers_all),
         "papers_with_abstract": used,
+        "paper_budget": search_size,
+        "stop_reason": stop or ("pmids_exhausted" if pmids_exhausted else None),
         "extraction_sources": sources,
         "llm_calls_used": llm_budget_ref["count"],
+        "llm_errors": llm_errors,
         "edges_kept": len(merged),
         "edge_limit": edge_limit,
         "new_partners": novel_kept,
@@ -242,15 +294,25 @@ async def _crawl_node(
         "edges_offered": offered,
         "edges_dropped_by_cap": dropped_by_cap,
     }
-    result = (list(merged.values()), papers, meta)
+    result = (list(merged.values()), papers_all, meta)
     # Only cache a result that actually spent its budget. A partial crawl is
     # a function of how much was already known when it ran, so serving it
     # later against a different `seen` set would be wrong.
     # The 4th element (claimed symbols) is cache-only: the caller contract
     # stays a 3-tuple, but a HIT needs these to rebuild the frontier.
-    complete = novel_kept >= edge_limit or used >= MAX_ABSTRACTS_FOR_EXTRACTION
+    # PubMed-exhausted results are cacheable: there is no more evidence to
+    # find, so a later crawl would reach the same papers.
+    # A crawl where EVERY extraction errored is never cached: that outcome
+    # describes broken infrastructure (rate limits, dead loops), not the
+    # protein, and caching it poisons all later requests with an empty graph.
+    all_errored = used > 0 and llm_errors >= used
+    complete = (
+        novel_kept >= edge_limit
+        or used >= search_size
+        or pmids_exhausted
+    ) and not all_errored
     if complete:
-        cache.set(cache_key, (list(merged.values()), papers, meta, sorted(new_symbols)))
+        cache.set(cache_key, (list(merged.values()), papers_all, meta, sorted(new_symbols)))
     else:
         logger.info(
             "Node %s: partial crawl (%d/%d new partners) not cached",
@@ -259,7 +321,7 @@ async def _crawl_node(
     logger.info(
         "Node crawl complete for '%s': %d new partners, %d redundant, "
         "%d edges from %d papers",
-        protein.node_id, novel_kept, redundant_kept, len(merged), len(papers),
+        protein.node_id, novel_kept, redundant_kept, len(merged), len(papers_all),
     )
     return result
 
@@ -292,9 +354,11 @@ async def collect_interactions(
 
     Algorithm:
       1. Start with the root protein as the frontier (level 0).
-      2. For each node in the frontier: search PubMed, fetch papers,
-         extract interactions via LLM -- capped at `edges_per_node` NEW
-         interactions for that node.
+      2. For each node in the frontier: search PubMed, fetch papers in
+         batches, extract interactions via LLM -- capped at `edges_per_node`
+         NEW interactions for that node. Fetching continues batch by batch
+         until the node's quota fills, PubMed runs dry, or the LLM backstop
+         trips.
       3. Collect all discovered neighbour proteins.
       4. Those neighbours become the next frontier (level 1).
       5. Repeat until depth is reached, the frontier is empty, or the

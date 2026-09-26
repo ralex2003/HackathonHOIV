@@ -121,6 +121,7 @@ function GraphVisualization() {
 
       return {
         ...node,
+        mass: level === 0 ? 6 : Math.max(1, 3 - level * 0.5),
         color: {
           background: color,
           border: color,
@@ -232,21 +233,31 @@ function GraphVisualization() {
         selectionWidth: 3,
       },
       layout: {
+        improvedLayout: true,
         hierarchical: {
-          enabled: true,
-          direction: 'DU',           // down: root at top, children below
-          sortMethod: 'directed',    // respect edge direction for level assignment
-          levelSeparation: 160,      // vertical gap between levels
-          nodeSpacing: 120,          // horizontal gap between nodes in same level
-          treeSpacing: 250,          // gap between subtrees
-          blockShifting: true,       // shift blocks to minimize edge crossings
-          edgeMinimization: true,    // minimize edge crossings
-          shakeTowards: 'roots',     // keep roots near the top
-          parentCentralization: true,
-        }
+          enabled: false,   // radial force-directed spread, not one-direction layers
+        },
+        randomSeed: 42,     // deterministic start so re-renders don't reshuffle
       },
       physics: {
-        enabled: false,   // disable force-directed; hierarchical handles positioning
+        enabled: true,
+        solver: 'barnesHut',
+        stabilization: {
+          enabled: true,
+          iterations: 1200,
+          updateInterval: 25,
+          fit: true,
+        },
+        barnesHut: {
+          gravitationalConstant: -12000, // strong repulsion: even radial spread
+          centralGravity: 0.55,          // gentle pull to centre (central node stays middle)
+          springLength: 230,             // longer springs: room to click between nodes
+          springConstant: 0.04,
+          damping: 0.09,
+          avoidOverlap: 0.8,
+        },
+        maxVelocity: 50,
+        minVelocity: 0.5,
       },
       interaction: {
         hover: true,
@@ -283,6 +294,11 @@ function GraphVisualization() {
     // opening the connection summary.
     network.on('selectNode', (params) => handleNodeSelect(params.nodes[0]));
     network.on('selectEdge', (params) => handleEdgeSelect(params.edges[0]));
+    // Once the force layout settles, fit everything into view so no cluster
+    // sits off-screen in one direction.
+    network.once('stabilizationIterationsDone', () => {
+      network.fit({ animation: { duration: 400, easingFunction: 'easeInOutQuad' } });
+    });
 
     // Configure tooltips via CSS
     const style = document.createElement('style');

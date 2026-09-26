@@ -16,6 +16,7 @@ import json
 import os
 import re
 import logging
+import threading
 from typing import Dict, List, Optional
 
 from app.models.interaction import Interaction
@@ -95,15 +96,23 @@ class OpenAICompatibleBackend(LLMBackend):
         except ValueError:
             self.min_interval = 0.6
         self._last_call = 0.0
-        self._pace_lock = asyncio.Lock()
+        # Guard for _last_call. This MUST be a threading.Lock, not an
+        # asyncio.Lock: Flask runs every request on its own event loop
+        # (asyncio.run per request), so an asyncio.Lock created here binds
+        # to the first request's loop and every later request dies with
+        # "RuntimeError: ... is bound to a different event loop" -- which
+        # surfaces as zero-edge graphs with all extractions FAILED.
+        # (Same class of bug AsyncRateLimiter already guards against.)
+        self._pace_guard = threading.Lock()
 
     async def _pace(self) -> None:
         loop = asyncio.get_running_loop()
-        async with self._pace_lock:
+        with self._pace_guard:
             wait = self.min_interval - (loop.time() - self._last_call)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            self._last_call = loop.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        with self._pace_guard:
+            self._last_call = asyncio.get_running_loop().time()
 
     async def complete(self, prompt: str, max_tokens: int = 1024) -> str:
         messages = [{"role": "user", "content": prompt}]
