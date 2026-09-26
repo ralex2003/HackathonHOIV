@@ -40,7 +40,8 @@ function ProteinDetailsPanel() {
       const graphData = await getGraph(
         node.id,
         state.depth,
-        activeFilters
+        activeFilters,
+        state.edgesPerNode
       );
       logger.info(`Connections loaded: ${graphData.nodes?.length || 0} nodes, ${graphData.edges?.length || 0} edges`);
       dispatch({ type: 'SET_GRAPH_DATA', payload: graphData });

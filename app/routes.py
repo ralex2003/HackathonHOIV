@@ -27,13 +27,32 @@ llm_service = LLMService()
 graph_service = GraphService()
 protein_resolver = ProteinResolver()
 
-MAX_PAPERS = 3
+MAX_PAPERS = 5  
 MAX_ABSTRACTS_FOR_EXTRACTION = int(
-    os.environ.get("PROTEIN_LLM_MAX_ABSTRACTS", "3")
+    os.environ.get("PROTEIN_LLM_MAX_ABSTRACTS", "5")
 )
-# Total cap on LLM calls across ALL levels of the crawl.
+# Total cap on LLM calls across ALL levels of the crawl.  
 # At 3 abstracts per node and 2 levels, that's ~9 calls max for depth=2.
-MAX_LLM_CALLS = int(os.environ.get("PROTEIN_LLM_MAX_TOTAL_CALLS", "30"))
+# New interactions kept per crawled node. Deliberately a PER-NODE budget: a
+# node discovered at level 3 gets the same allowance as the root, so `depth`
+# actually controls how much of the graph gets explored.
+#
+# This used to be a single global cap shared across the whole crawl. The root
+# ate the first slice, the next few level-1 nodes ate the rest, and every
+# remaining node returned zero interactions -- which made the depth slider
+# almost meaningless past depth 1.
+MAX_EDGES_PER_NODE = int(os.environ.get("PROTEIN_MAX_EDGES_PER_NODE", "5"))
+
+# Clamp for the user-supplied value so one request cannot ask for an
+# unbounded crawl.
+EDGES_PER_NODE_MIN = 1
+EDGES_PER_NODE_MAX = 25
+
+# Absolute ceiling on LLM calls for one entire crawl. This is a runaway-cost
+# backstop, NOT the primary limiter -- that job belongs to
+# MAX_EDGES_PER_NODE. It is intentionally generous so recursion can finish; if
+# it trips, the response says so via meta["truncations"].
+MAX_LLM_CALLS = int(os.environ.get("PROTEIN_LLM_MAX_TOTAL_CALLS", "300"))
 
 def run_async(coro):
     return asyncio.run(coro)
@@ -46,18 +65,43 @@ def _json_body() -> dict:
 async def _crawl_node(
     protein: Protein,
     max_papers: int,
+    edge_limit: int,
     llm_budget_ref: dict,
+    seen: Set[str],
 ) -> Tuple[List[Interaction], List[Paper], dict]:
     """Fetch papers for one protein and extract interactions from their abstracts.
+
+    `edge_limit` caps how many NEW proteins this node may contribute to the
+    graph. `seen` is the shared set of symbols already in the graph; it is
+    mutated in place with anything this node discovers, so sibling nodes
+    cannot waste budget re-discovering the same protein.
+
+    Edges back into the existing graph are kept (they are real evidence) but
+    do not consume budget -- only genuinely new partners do.
 
     Returns (interactions, papers, meta) for this single node.
     Respects llm_budget_ref and returns empty results if the budget is exhausted.
     """
     terms = protein.search_terms()
     if not terms:
-        return [], [], {"query": None, "total_matches": 0, "skipped": "no_search_terms"}
+        # Same keys as the normal path, so callers can read edges_kept /
+        # edges_dropped_by_cap without a KeyError on a skipped node.
+        return [], [], {
+            "query": None,
+            "total_matches": 0,
+            "skipped": "no_search_terms",
+            "edges_kept": 0,
+            "edge_limit": edge_limit,
+            "edges_offered": 0,
+            "edges_dropped_by_cap": 0,
+        }
 
-    cache_key = f"node:{protein.uniprot_id}:{max_papers}:{llm_service.is_configured}"
+    # edge_limit is part of the key: a node crawled with a limit of 5 must not
+    # be served from a cache entry built with a limit of 25.
+    cache_key = (
+        f"node:{protein.uniprot_id}:{max_papers}:{edge_limit}:"
+        f"{llm_service.is_configured}"
+    )
     cached = cache.get(cache_key)
     if cached is not None:
         logger.info("Node cache HIT for %s", protein.node_id)
@@ -72,10 +116,32 @@ async def _crawl_node(
     merged: dict = {}
     used = 0
     sources: dict = {}
+    offered = 0          # interactions the LLM proposed, before capping
+    novel_kept = 0       # kept edges whose far endpoint was NOT already seen
+    redundant_kept = 0   # kept edges pointing back into the existing graph
+    dropped_by_cap = 0   # proposed but over this node's novel budget
+    new_symbols: Set[str] = set()
 
     for paper in papers:
-        if not paper.abstract or used >= MAX_ABSTRACTS_FOR_EXTRACTION:
+        if not paper.abstract:
             continue
+        # Budget spent: stop when this node has found `edge_limit` proteins
+        # that were NOT already in the graph. Edges pointing back at
+        # already-known proteins are still kept (they are real evidence) but
+        # they do not consume budget, because they cannot expand the frontier.
+        #
+        # This is the whole point: a per-node budget spent on *any* edge gets
+        # swallowed by re-links to existing nodes -- measured 5 novel vs 25
+        # redundant -- so the graph never grew past one ring no matter how
+        # high the depth slider went.
+        if novel_kept >= edge_limit:
+            break
+        if used >= MAX_ABSTRACTS_FOR_EXTRACTION:
+            logger.info(
+                "Node %s hit abstract cap (%d) with only %d/%d NEW partners",
+                protein.node_id, MAX_ABSTRACTS_FOR_EXTRACTION, novel_kept, edge_limit,
+            )
+            break
         if llm_budget_ref["count"] >= llm_budget_ref["max"]:
             logger.warning("LLM budget exhausted at node %s", protein.node_id)
             break
@@ -83,8 +149,11 @@ async def _crawl_node(
         used += 1
         llm_budget_ref["count"] += 1
         logger.debug(
-            "Extracting interactions from PMID=%s (%d/%d max_llm=%d)",
-            paper.pmid, llm_budget_ref["count"], llm_budget_ref["max"], llm_budget_ref["max"],
+            "Extracting interactions from PMID=%s for %s "
+            "(%d/%d max_llm=%d, %d/%d new partners so far)",
+            paper.pmid, protein.node_id,
+            llm_budget_ref["count"], llm_budget_ref["max"], llm_budget_ref["max"],
+            novel_kept, edge_limit,
         )
         extracted = await llm_service.extract_interactions(paper.abstract, symbol)
         source = extracted.get("source", "unknown")
@@ -94,6 +163,7 @@ async def _crawl_node(
             tgt = item.get("target_protein")
             if not src or not tgt or src == tgt:
                 continue
+            offered += 1
             interaction = Interaction(
                 source_protein=src,
                 target_protein=tgt,
@@ -105,9 +175,30 @@ async def _crawl_node(
             )
             key = interaction.key()
             if key in merged:
+                # Free: no extra LLM call, and it strengthens the evidence on
+                # an edge we already kept. Always allowed.
                 merged[key].merge(interaction)
-            else:
+                continue
+
+            # Novelty test: which endpoint is the neighbour, from this node?
+            far = tgt if src == symbol else src
+            already = far in seen
+            if already:
+                # A re-link into the existing graph. Keep it -- it is genuine
+                # evidence and costs nothing -- but do not spend budget on it.
                 merged[key] = interaction
+                redundant_kept += 1
+            elif novel_kept < edge_limit:
+                merged[key] = interaction
+                novel_kept += 1
+                new_symbols.add(far)
+                # Claim it immediately so a sibling node cannot spend its
+                # budget re-discovering the same protein.
+                seen.add(far)
+            else:
+                # Over this node's novel-partner budget. Counted and reported
+                # rather than silently dropped.
+                dropped_by_cap += 1
 
     meta = {
         "query": query,
@@ -116,18 +207,55 @@ async def _crawl_node(
         "papers_with_abstract": used,
         "extraction_sources": sources,
         "llm_calls_used": llm_budget_ref["count"],
+        "edges_kept": len(merged),
+        "edge_limit": edge_limit,
+        "new_partners": novel_kept,
+        "redundant_edges": redundant_kept,
+        "edges_offered": offered,
+        "edges_dropped_by_cap": dropped_by_cap,
     }
     result = (list(merged.values()), papers, meta)
-    cache.set(cache_key, result)
+    # Only cache a result that actually spent its budget. A partial crawl is
+    # a function of how much was already known when it ran, so serving it
+    # later against a different `seen` set would be wrong.
+    complete = novel_kept >= edge_limit or used >= MAX_ABSTRACTS_FOR_EXTRACTION
+    if complete:
+        cache.set(cache_key, result)
+    else:
+        logger.info(
+            "Node %s: partial crawl (%d/%d new partners) not cached",
+            protein.node_id, novel_kept, edge_limit,
+        )
     logger.info(
-        "Node crawl complete for '%s': %d interactions from %d papers",
-        protein.node_id, len(merged), len(papers),
+        "Node crawl complete for '%s': %d new partners, %d redundant, "
+        "%d edges from %d papers",
+        protein.node_id, novel_kept, redundant_kept, len(merged), len(papers),
     )
     return result
 
 
+def _clamp_edges_per_node(value) -> int:
+    """Clamp a user-supplied per-node edge budget to a sane range.
+
+    Single source of truth: both /api/graph and collect_interactions route
+    through this, so a value cannot mean one thing at the edge and something
+    else deeper in. Junk, zero and negatives fall back to the default rather
+    than raising or silently becoming a 1-edge crawl.
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return MAX_EDGES_PER_NODE
+    if n <= 0:
+        return MAX_EDGES_PER_NODE
+    return max(EDGES_PER_NODE_MIN, min(n, EDGES_PER_NODE_MAX))
+
+
 async def collect_interactions(
-    protein: Protein, max_papers: int = MAX_PAPERS, depth: int = 2
+    protein: Protein,
+    max_papers: int = MAX_PAPERS,
+    depth: int = 2,
+    edges_per_node: int = MAX_EDGES_PER_NODE,
 ) -> Tuple[List[Interaction], List, dict]:
     """Multi-level BFS crawl: collects interactions from the root protein AND
     recursively from all discovered neighbours up to the requested depth.
@@ -135,19 +263,27 @@ async def collect_interactions(
     Algorithm:
       1. Start with the root protein as the frontier (level 0).
       2. For each node in the frontier: search PubMed, fetch papers,
-         extract interactions via LLM.
+         extract interactions via LLM -- capped at `edges_per_node` NEW
+         interactions for that node.
       3. Collect all discovered neighbour proteins.
       4. Those neighbours become the next frontier (level 1).
       5. Repeat until depth is reached, the frontier is empty, or the
-         LLM budget is exhausted.
+         absolute LLM backstop is exhausted.
       6. Canonicalise all endpoints across all levels and merge.
+
+    Every node in every level receives its own `edges_per_node` allowance, so
+    recursion is uniform: depth=3 with edges_per_node=5 means every node
+    contributes up to 5 of its own new edges, not 5 edges shared across the
+    whole graph.
 
     Returns (all_interactions, all_papers, meta).
     """
     depth = max(1, min(int(depth or 1), 5))
+    edge_limit = _clamp_edges_per_node(edges_per_node)
     logger.info(
-        "collect_interactions START for protein='%s', max_papers=%d, depth=%d",
-        protein.node_id, max_papers, depth,
+        "collect_interactions START for protein='%s', max_papers=%d, depth=%d, "
+        "edges_per_node=%d",
+        protein.node_id, max_papers, depth, edge_limit,
     )
 
     llm_budget = {"count": 0, "max": MAX_LLM_CALLS}
@@ -156,6 +292,10 @@ async def collect_interactions(
     all_interactions: List[Interaction] = []
     all_papers: List[Paper] = []
     truncations: List[dict] = []
+    # Declared OUTSIDE the level loop: it used to be re-initialised per level,
+    # so meta for the root and every earlier level was silently discarded and
+    # only the last level survived into the response.
+    per_node_meta: Dict[str, dict] = {}
 
     for level in range(depth):
         if not frontier:
@@ -168,24 +308,31 @@ async def collect_interactions(
 
         next_frontier_proteins: List[Protein] = []
         level_interactions: List[Interaction] = []
-        per_node_meta: Dict[str, dict] = {}
 
         for node_protein in frontier:
+            before = set(visited)
             interactions, papers, meta = await _crawl_node(
-                node_protein, max_papers, llm_budget
+                node_protein, max_papers, edge_limit, llm_budget, visited
             )
             level_interactions.extend(interactions)
             all_papers.extend(papers)
             per_node_meta[node_protein.node_id] = meta
 
-            # Discover new proteins at this level for the next frontier.
-            for interaction in interactions:
-                for endpoint in (interaction.source_protein, interaction.target_protein):
-                    if endpoint not in visited:
-                        visited.add(endpoint)
-                        resolved = await protein_service.get_protein_by_name(endpoint)
-                        if resolved:
-                            next_frontier_proteins.append(resolved)
+            # `visited` already contains everything this node claimed, so
+            # whatever it added is exactly the new frontier material.
+            for symbol in visited - before:
+                resolved = await protein_service.get_protein_by_name(symbol)
+                if resolved:
+                    next_frontier_proteins.append(resolved)
+                else:
+                    # Claimed by the crawl but not resolvable to a Protein, so
+                    # it can never be crawled itself. It still appears in the
+                    # graph as a node with its edges; it just has no children.
+                    logger.info(
+                        "New symbol '%s' (from %s) is not resolvable; "
+                        "it will appear as a leaf node only",
+                        symbol, node_protein.node_id,
+                    )
 
         all_interactions.extend(level_interactions)
 
@@ -197,6 +344,7 @@ async def collect_interactions(
         frontier = next_frontier_proteins
 
     # Canonicalise ALL endpoints across ALL levels at once.
+    ambiguities: List[dict] = []
     if all_interactions:
         endpoints: Set[str] = set()
         for interaction in all_interactions:
@@ -217,10 +365,15 @@ async def collect_interactions(
             if not new_source or not new_target or new_source == new_target:
                 dropped += 1
                 continue
+            # Compare BEFORE overwriting. Assigning first and then comparing
+            # new_source to interaction.source_protein compares a value with
+            # itself, so this count was always 0 and the canonicalisation
+            # summary was silently blank.
+            if (new_source != interaction.source_protein
+                    or new_target != interaction.target_protein):
+                rewritten += 1
             interaction.source_protein = new_source
             interaction.target_protein = new_target
-            if new_source != interaction.source_protein or new_target != interaction.target_protein:
-                rewritten += 1
 
         # Re-merge edges that collapsed onto the same canonical pair.
         merged_map: dict = {}
@@ -240,16 +393,51 @@ async def collect_interactions(
             "Global canonicalisation: %d rewritten, %d dropped, %d final edges",
             rewritten, dropped, len(all_interactions),
         )
+        # A symbol UniProt claims for two proteins is resolved (canonical name
+        # wins) but reported, so a node label the user distrusts can be
+        # explained rather than looked like a search error.
+        # protein_resolver is a process-wide singleton, so `ambiguous`
+        # accumulates across requests. Filter to this crawl's own symbols or
+        # the report would keep growing and mention unrelated proteins.
+        endpoints_norm = {protein_resolver.normalize(s) for s in endpoints}
+        ambiguities = [
+            a for a in protein_resolver.ambiguity_report()
+            if protein_resolver.normalize(a["symbol"]) in endpoints_norm
+        ]
+        if ambiguities:
+            logger.warning(
+                "%d ambiguous symbol(s) resolved by canonical-name priority: %s",
+                len(ambiguities),
+                ", ".join(
+                    f"{a['symbol']} -> {a['chosen']} (also maps to "
+                    f"{', '.join(a['alternatives'])})"
+                    for a in ambiguities[:5]
+                ),
+            )
 
+    nodes_crawled = len(per_node_meta)
+    capped_nodes = sum(
+        1 for m in per_node_meta.values() if m.get("edges_dropped_by_cap", 0) > 0
+    )
+    total_new = sum(m.get("new_partners", 0) for m in per_node_meta.values())
+    total_redundant = sum(
+        m.get("redundant_edges", 0) for m in per_node_meta.values()
+    )
     meta = {
         "max_papers": max_papers,
         "depth_requested": depth,
+        "edges_per_node": edge_limit,
+        "nodes_crawled": nodes_crawled,
+        "nodes_hitting_edge_cap": capped_nodes,
+        "new_partners_found": total_new,
+        "redundant_edges": total_redundant,
         "levels_completed": depth if not truncations else truncations[-1].get("level", 0),
         "total_llm_calls": llm_budget["count"],
         "max_llm_calls": MAX_LLM_CALLS,
         "truncations": truncations,
         "per_node_meta": per_node_meta if all_interactions else {},
         "total_pmids": len(all_papers),
+        "ambiguous_symbols": ambiguities,
     }
 
     logger.info(
@@ -340,7 +528,15 @@ def get_interactions():
         return jsonify({"error": "Protein not found"}), 404
 
     logger.info("Collecting interactions for protein '%s'...", protein_id)
-    interactions, _papers, meta = run_async(collect_interactions(protein, depth=depth))
+    interactions, _papers, meta = run_async(
+        collect_interactions(
+            protein,
+            depth=depth,
+            edges_per_node=_clamp_edges_per_node(
+                _json_body().get("edges_per_node")
+            ),
+        )
+    )
     logger.info(
         "Interactions collected for '%s': %d interactions, %d papers",
         protein_id, len(interactions), meta.get("total_pmids", 0),
@@ -407,10 +603,13 @@ def get_graph():
     protein_id = (body.get("protein_id") or "").strip()
     depth = body.get("depth", 2)
     filters = body.get("filters")
+    # Per-node edge budget, controlled by the UI slider. Clamped server-side:
+    # the client value is a hint, not authority.
+    edges_per_node = _clamp_edges_per_node(body.get("edges_per_node"))
 
     logger.info(
-        "POST /api/graph — protein_id='%s', depth=%d, filters=%s",
-        protein_id, depth, filters,
+        "POST /api/graph — protein_id='%s', depth=%s, edges_per_node=%d, filters=%s",
+        protein_id, depth, edges_per_node, filters,
     )
     if not protein_id:
         logger.warning("Graph request rejected: missing protein_id")
@@ -422,7 +621,11 @@ def get_graph():
         return jsonify({"error": "Protein not found"}), 404
 
     logger.info("Collecting interactions for graph building...")
-    interactions, papers, meta = run_async(collect_interactions(protein, depth=depth))
+    interactions, papers, meta = run_async(
+        collect_interactions(
+            protein, depth=depth, edges_per_node=edges_per_node
+        )
+    )
     logger.info(
         "Building graph: %d interactions, %d papers, depth=%d",
         len(interactions), len(papers), depth,
@@ -434,6 +637,29 @@ def get_graph():
     ]
     graph_data["meta"] = {**meta, **graph_data.get("stats", {})}
     graph_data["llm"] = llm_service.health()
+
+    # Secondary, non-competing messages. `warning` above is a single banner
+    # picked by priority, so anything that must not hide a truncation goes
+    # here instead of competing for that slot.
+    notices: List[str] = []
+    for a in meta.get("ambiguous_symbols") or []:
+        others = ", ".join(a.get("alternatives") or [])
+        notices.append(
+            f"UniProt gives '{a['symbol']}' to more than one protein. It was "
+            f"matched to {a['chosen']} because that is its official gene "
+            f"name, but it is also a recorded name for {others}. If you "
+            f"expected {others}, the node label is the resolver's choice, not "
+            f"a PubMed error."
+        )
+    if meta.get("redundant_edges"):
+        notices.append(
+            f"{meta['redundant_edges']} of the edges link proteins that were "
+            f"already in the graph. They are kept as evidence but did not "
+            f"count towards the {meta.get('edges_per_node')}-new-partners "
+            f"budget, which only counts proteins not seen before."
+        )
+    if notices:
+        graph_data["notices"] = notices
 
     if pubmed_service.last_error:
         graph_data["warning"] = (
@@ -449,13 +675,36 @@ def get_graph():
         )
         graph_data["severity"] = "error"
     elif meta.get("truncations"):
-        trunc = meta["truncations"][0]
+        # Render the reason readably instead of interpolating a raw dict.
+        parts = []
+        for t in meta["truncations"]:
+            if t.get("reason") == "max_llm_calls":
+                parts.append(
+                    f"the {meta.get('max_llm_calls')}-call safety ceiling was hit "
+                    f"at level {t.get('level')}"
+                )
+            else:
+                parts.append(f"{t.get('reason')} at level {t.get('level')}")
         graph_data["warning"] = (
-            f"Crawl was truncated: {trunc}. "
-            f"Total LLM calls used: {meta.get('total_llm_calls', 0)}/{meta.get('max_llm_calls', 'unknown')}. "
-            f"Graph may be incomplete."
+            f"Crawl stopped early: {'; '.join(parts)}. "
+            f"LLM calls used: {meta.get('total_llm_calls', 0)}"
+            f"/{meta.get('max_llm_calls', 'unknown')}. "
+            f"Ran {meta.get('nodes_crawled', 0)} protein(s) to depth "
+            f"{meta.get('levels_completed', 0)} of {meta.get('depth_requested', '?')}. "
+            f"The graph is incomplete."
         )
         graph_data["severity"] = "warning"
+    elif meta.get("nodes_hitting_edge_cap"):
+        # Not a failure -- the per-node cap working as designed. Surfaced so
+        # the user knows the slider is the thing to raise for a denser graph.
+        capped = meta["nodes_hitting_edge_cap"]
+        crawled = meta.get("nodes_crawled", 0)
+        graph_data["warning"] = (
+            f"{capped} of {crawled} protein(s) hit the "
+            f"{meta.get('edges_per_node')}-edge-per-node limit, so those nodes "
+            f"were cut off mid-paper. Raise 'Edges per node' for a denser graph."
+        )
+        graph_data["severity"] = "info"
     elif not meta.get("per_node_meta"):
         graph_data["warning"] = (
             "PubMed returned no papers for this protein, so there is no "
@@ -514,7 +763,13 @@ def validate_graph():
     if not protein:
         return jsonify({"error": "Protein not found"}), 404
 
-    interactions, _papers, _meta = run_async(collect_interactions(protein, depth=depth))
+    interactions, _papers, _meta = run_async(
+        collect_interactions(
+            protein,
+            depth=depth,
+            edges_per_node=_clamp_edges_per_node(body.get("edges_per_node")),
+        )
+    )
     graph_data = graph_service.build_graph(protein, interactions, depth, filters)
 
     report = run_async(

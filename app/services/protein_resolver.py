@@ -42,6 +42,14 @@ class ProteinResolver:
         self.timeout = timeout
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "protein-friend-finder/0.1"})
+        # (symbol, chosen_canonical, rejected_canonical) triples seen this
+        # process. Surfaced by ambiguity_report() so a name that is genuinely
+        # two proteins cannot be silently mis-resolved.
+        self.ambiguous: set = set()
+        # symbol -> {rejected_canonical} for the batch currently being fetched.
+        # Read by resolve_many so the record can be cached next to the
+        # mapping. Reset at the top of every _fetch_batch call.
+        self._last_ambiguity: Dict[str, set] = {}
 
     # ---------------------------------------------------------------- helpers
 
@@ -81,15 +89,24 @@ class ProteinResolver:
             cached = cache.get(self._cache_key(symbol))
             if cached is not None:
                 result[symbol] = cached
+                # Re-hydrate the ambiguity record too. Without this a symbol
+                # served from cache resolves correctly but silently stops
+                # being reported as ambiguous.
+                for rejected in cache.get(self._ambig_cache_key(symbol)) or ():
+                    self.ambiguous.add((symbol, cached, rejected))
             else:
                 pending.append(symbol)
 
         if pending:
             fetched = await asyncio.to_thread(self._fetch_batch, pending)
+            rejected = self._last_ambiguity
             for symbol in pending:
                 canonical = fetched.get(symbol, symbol)
                 result[symbol] = canonical
                 cache.set(self._cache_key(symbol), canonical)
+                losers = sorted(rejected.get(symbol, ()))
+                if losers:
+                    cache.set(self._ambig_cache_key(symbol), losers)
 
         return result
 
@@ -127,6 +144,10 @@ class ProteinResolver:
     def _cache_key(self, symbol: str) -> str:
         return f"symresolve:{self.organism}:{symbol}"
 
+    def _ambig_cache_key(self, symbol: str) -> str:
+        """Cache slot for the losing alternatives of an ambiguous symbol."""
+        return f"symambig:{self.organism}:{symbol}"
+
     def _accession_for(self, symbol: str) -> Optional[str]:
         payload = self._search([symbol])
         if not payload:
@@ -155,41 +176,105 @@ class ProteinResolver:
             return []
 
     def _fetch_batch(self, symbols: List[str]) -> Dict[str, str]:
-        """One request for many symbols; returns {symbol: canonical}."""
-        resolved: Dict[str, str] = {}
+        """One request for many symbols; returns {symbol: canonical}.
 
-        # UniProt caps URL length, so chunk defensively.
+        A queried symbol can be claimed by more than one UniProt entry: either
+        as its canonical gene name, or as somebody's synonym. These collisions
+        are real, not hypothetical -- UniProt lists PAF1 as a SYNONYM of PEX2
+        (P28328) while PAF1 is also the canonical name of Q8N7H5.
+
+        The old code registered every name in a plain dict, so the entry
+        returned LAST silently overwrote the other. That made the mapping
+        depend on UniProt's result ordering, which is not stable: the same
+        symbol could canonicalise to different proteins on different runs or in
+        different batches. Verified: 'PAF1' resolved to PEX2 when queried
+        alone and to PAF1 when batched with PEX2.
+
+        Rule now applied: a canonical-name match always beats a synonym-only
+        match. A symbol that is genuinely two proteins' canonical name is
+        still reported as ambiguous rather than silently picked.
+        """
+        # rank 0 = the symbol is this entry's canonical gene name
+        # rank 1 = the symbol is only a synonym / ordered locus name
+        best: Dict[str, Tuple[int, str]] = {}
+        self._last_ambiguity = {}
+
+        def offer(key: str, canonical: str, rank: int) -> None:
+            current = best.get(key)
+            if current is None or rank < current[0]:
+                best[key] = (rank, canonical)
+            elif rank == current[0] and canonical != current[1]:
+                # Two proteins claim this symbol equally well and neither owns
+                # it canonically, so there is no principled winner. Break the
+                # tie on the canonical name instead of on arrival order, so
+                # the answer cannot change between runs, and record it.
+                self.ambiguous.add((key, current[1], canonical))
+                self._last_ambiguity.setdefault(key, set()).update(
+                    (current[1], canonical)
+                )
+                if canonical < current[1]:
+                    best[key] = (rank, canonical)
+
         for start in range(0, len(symbols), 40):
             chunk = symbols[start : start + 40]
             for entry in self._search(chunk):
                 genes = entry.get("genes") or []
                 if not genes:
                     continue
-                canonical = (genes[0].get("geneName") or {}).get("value")
+                gene = genes[0]
+                canonical = (gene.get("geneName") or {}).get("value")
                 if not canonical:
                     continue
                 accession = entry.get("primaryAccession")
+                canonical_key = self.normalize(canonical)
+
+                # Register the canonical name and every synonym against it.
+                names = {canonical_key}
+                for group in (gene.get("synonyms") or [],
+                              gene.get("orderedLocusNames") or []):
+                    for item in group:
+                        value = (item or {}).get("value")
+                        if value:
+                            names.add(self.normalize(value))
+
+                for key in names:
+                    offer(key, canonical, 0 if key == canonical_key else 1)
                 logger.debug(
                     "Resolved %s -> %s (%s)", chunk, canonical, accession
                 )
-                # Register the canonical name and every synonym against it.
-                names = {canonical}
-                for synonym in genes[0].get("synonyms") or []:
-                    value = (synonym or {}).get("value")
-                    if value:
-                        names.add(value)
-                for locus in genes[0].get("orderedLocusNames") or []:
-                    value = (locus or {}).get("value")
-                    if value:
-                        names.add(value)
-                for name in names:
-                    resolved[self.normalize(name)] = canonical
 
+        resolved: Dict[str, str] = {}
         for symbol in symbols:
-            resolved.setdefault(symbol, symbol)
+            hit = best.get(symbol)
+            # Unknown symbols come back unchanged: we never drop a partner
+            # protein just because we could not identify it.
+            resolved[symbol] = hit[1] if hit else symbol
         return resolved
 
     # ------------------------------------------------------------ validation
+
+    def ambiguity_report(self) -> List[dict]:
+        """Symbols UniProt claims for more than one protein.
+
+        A canonical-name match always wins over a synonym match, so these
+        resolve deterministically -- but the losing protein is a real
+        alternative reading and callers may want to surface it.
+        """
+        out: Dict[str, dict] = {}
+        for symbol, chosen, rejected in sorted(self.ambiguous):
+            # A symbol is not an alternative reading of itself. This can arise
+            # because the cache stores every rejected candidate while
+            # self.ambiguous stores both orderings of the pair.
+            if rejected == chosen:
+                continue
+            row = out.setdefault(
+                symbol, {"symbol": symbol, "chosen": chosen, "alternatives": []}
+            )
+            if rejected not in row["alternatives"]:
+                row["alternatives"].append(rejected)
+        for row in out.values():
+            row["alternatives"].sort()
+        return list(out.values())
 
     async def identity_groups(self, symbols: Iterable[str]) -> Dict[str, List[str]]:
         """Group input symbols that denote the same protein.

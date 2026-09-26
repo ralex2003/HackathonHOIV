@@ -366,6 +366,28 @@ function AppContent() {
             </Box>
           )}
 
+          {/* Secondary notes. The banner above is single-slot and priority
+              ordered, so anything that must not hide a truncation -- e.g. a
+              symbol UniProt gives to two proteins -- arrives here. */}
+          {state.graphData?.notices?.length > 0 && (
+            <Box sx={{ m: 3, maxWidth: 500 }}>
+              {state.graphData.notices.map((notice, i) => (
+                <Alert
+                  key={i}
+                  severity="info"
+                  sx={{
+                    mt: 1,
+                    backgroundColor: 'rgba(56, 189, 248, 0.1)',
+                    border: '1px solid rgba(56, 189, 248, 0.3)',
+                    borderRadius: 12,
+                  }}
+                >
+                  {notice}
+                </Alert>
+              ))}
+            </Box>
+          )}
+
           {!state.loading && !state.error && !state.graphData && (
             <Box
               sx={{

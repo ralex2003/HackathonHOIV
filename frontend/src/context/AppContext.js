@@ -18,6 +18,9 @@ const initialState = {
     genetic: true,
   },
   depth: 2,
+  // New edges requested PER NODE, not per crawl. Each node discovered at any
+  // depth gets its own allowance, so depth>1 actually recurses.
+  edgesPerNode: 5,
 };
 
 function appReducer(state, action) {
@@ -47,6 +50,8 @@ function appReducer(state, action) {
       };
     case 'SET_DEPTH':
       return { ...state, depth: action.payload };
+    case 'SET_EDGES_PER_NODE':
+      return { ...state, edgesPerNode: action.payload };
     case 'RESET':
       return initialState;
     default:

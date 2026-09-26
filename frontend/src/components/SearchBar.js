@@ -12,11 +12,20 @@ function SearchBar() {
   const [query, setQuery] = useState('');
   const logger = searchLogger;
   const [localDepth, setLocalDepth] = useState(state.depth || 2);
+  const [localEdgesPerNode, setLocalEdgesPerNode] = useState(
+    state.edgesPerNode || 5
+  );
 
   const handleDepthChange = (event, value) => {
     setLocalDepth(value);
     dispatch({ type: 'SET_DEPTH', payload: value });
     logger.debug(`Depth changed to ${value}`);
+  };
+
+  const handleEdgesPerNodeChange = (event, value) => {
+    setLocalEdgesPerNode(value);
+    dispatch({ type: 'SET_EDGES_PER_NODE', payload: value });
+    logger.debug(`Edges per node changed to ${value}`);
   };
 
   const handleSearch = async () => {
@@ -25,7 +34,10 @@ function SearchBar() {
       return;
     }
 
-    logger.info(`Search initiated: "${query}" (depth=${localDepth})`);
+    logger.info(
+      `Search initiated: "${query}" (depth=${localDepth}, ` +
+      `edgesPerNode=${localEdgesPerNode})`
+    );
     dispatch({ type: 'SET_LOADING', payload: true });
     dispatch({ type: 'SET_ERROR', payload: null });
 
@@ -43,7 +55,8 @@ function SearchBar() {
       const graphData = await getGraph(
         protein.uniprot_id,
         localDepth,
-        activeFilters.length ? activeFilters : null
+        activeFilters.length ? activeFilters : null,
+        localEdgesPerNode
       );
       logger.info(`Graph loaded: ${graphData.nodes?.length || 0} nodes, ${graphData.edges?.length || 0} edges`);
       dispatch({ type: 'SET_GRAPH_DATA', payload: graphData });
@@ -140,6 +153,44 @@ function SearchBar() {
           sx={{ flex: 1 }}
         />
       </Box>
+
+      <Box sx={{ px: 1, display: 'flex', alignItems: 'center', gap: 2, mt: 1.5 }}>
+        <Typography
+          variant="caption"
+          sx={{ color: '#A0A0B8', whiteSpace: 'nowrap', fontWeight: 500 }}
+        >
+          Edges per node: {localEdgesPerNode}
+        </Typography>
+        <Slider
+          value={localEdgesPerNode}
+          onChange={handleEdgesPerNodeChange}
+          min={1}
+          max={25}
+          step={1}
+          marks={[
+            { value: 1, label: '1' },
+            { value: 5, label: '5' },
+            { value: 10, label: '10' },
+            { value: 15, label: '15' },
+            { value: 20, label: '20' },
+            { value: 25, label: '25' },
+          ]}
+          valueLabelDisplay="auto"
+          disabled={state.loading}
+          aria-label="Maximum new edges per protein node"
+          sx={{ flex: 1 }}
+        />
+      </Box>
+
+      <Typography
+        variant="caption"
+        sx={{ color: '#6A6A85', display: 'block', mt: 1, px: 1 }}
+      >
+        Each protein contributes up to {localEdgesPerNode} NEW partners of its
+        own, so every layer grows {localEdgesPerNode}× wider. Extra edges back
+        to proteins already in the graph are still kept, but don't count
+        toward this number.
+      </Typography>
     </Box>
   );
 }

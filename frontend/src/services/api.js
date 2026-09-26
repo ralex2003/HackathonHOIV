@@ -59,9 +59,22 @@ export const getPaper = async (pmid) => {
   return response.data;
 };
 
-export const getGraph = async (proteinId, depth = 2, filters = null) => {
-  apiLogger.info(`Fetching graph: protein=${proteinId}, depth=${depth}, filters=${JSON.stringify(filters)}`);
-  const response = await api.post('/api/graph', { protein_id: proteinId, depth, filters });
+export const getGraph = async (
+  proteinId,
+  depth = 2,
+  filters = null,
+  edgesPerNode = 5
+) => {
+  apiLogger.info(
+    `Fetching graph: protein=${proteinId}, depth=${depth}, ` +
+    `edgesPerNode=${edgesPerNode}, filters=${JSON.stringify(filters)}`
+  );
+  const response = await api.post('/api/graph', {
+    protein_id: proteinId,
+    depth,
+    filters,
+    edges_per_node: edgesPerNode,
+  });
   apiLogger.info(`Graph loaded: ${response.data.nodes?.length || 0} nodes, ${response.data.edges?.length || 0} edges`);
   return response.data;
 };
